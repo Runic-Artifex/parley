@@ -144,6 +144,63 @@ where
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::PlainEditor;
+    use crate::editing::Cursor;
+    use crate::layout::{Affinity, Alignment, Cluster};
+    use crate::{FontContext, LayoutContext, StyleProperty};
+    use fontique::{Collection, CollectionOptions};
+
+    #[test]
+    fn selections_survive_fontless_layout_refreshes() {
+        let mut font_ctx = FontContext {
+            collection: Collection::new(CollectionOptions {
+                system_fonts: false,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut layout_ctx = LayoutContext::new();
+        let mut editor = PlainEditor::<()>::new(16.0);
+        editor.set_text("aéz");
+        editor.refresh_layout(&mut font_ctx, &mut layout_ctx);
+
+        // The collection has no fonts, so there are no shaped clusters to
+        // canonicalize against. Initial selection is still the logical start
+        // of the UTF-8 buffer.
+        let layout = editor.try_layout().unwrap();
+        assert!(Cluster::from_byte_index(layout, 0).is_none());
+        assert_eq!(editor.raw_selection().text_range(), 0..0);
+
+        // No-cluster positions beyond the buffer retain the established EOF
+        // behavior, rather than carrying an arbitrary requested affinity.
+        let eof = Cursor::from_byte_index(layout, usize::MAX, Affinity::Downstream);
+        assert_eq!(eof.index(), "aéz".len());
+        assert_eq!(eof.affinity(), Affinity::Upstream);
+
+        // A valid UTF-8 range must survive relayouts caused by the same kinds
+        // of changes a control sees while fonts and styling settle.
+        editor
+            .driver(&mut font_ctx, &mut layout_ctx)
+            .select_byte_range(1, 3);
+        assert_eq!(editor.raw_selection().text_range(), 1..3);
+
+        editor.set_width(Some(20.0));
+        editor.refresh_layout(&mut font_ctx, &mut layout_ctx);
+        assert_eq!(editor.raw_selection().text_range(), 1..3);
+
+        editor.set_scale(2.0);
+        editor.refresh_layout(&mut font_ctx, &mut layout_ctx);
+        assert_eq!(editor.raw_selection().text_range(), 1..3);
+
+        editor.set_alignment(Alignment::Center);
+        editor.edit_styles().insert(StyleProperty::FontSize(20.0));
+        editor.refresh_layout(&mut font_ctx, &mut layout_ctx);
+        assert_eq!(editor.raw_selection().text_range(), 1..3);
+    }
+}
+
 /// A short-lived wrapper around [`PlainEditor`].
 ///
 /// This can perform operations which require the editor's layout to

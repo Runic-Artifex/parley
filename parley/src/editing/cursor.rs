@@ -27,9 +27,22 @@ impl Cursor {
                 },
             }
         } else {
+            // A layout may temporarily have no shaped clusters while its font
+            // resources are unavailable. That must not move a logical editor
+            // selection to the end of its text merely because it cannot yet be
+            // represented geometrically.
+            let index = index.min(layout.data.text_len);
             Self {
-                index: layout.data.text_len,
-                affinity: Affinity::Upstream,
+                index,
+                affinity: if index == 0 {
+                    Affinity::Downstream
+                } else if index == layout.data.text_len {
+                    // Preserve the existing EOF affinity when the requested
+                    // position is at (or beyond) the end of unavailable text.
+                    Affinity::Upstream
+                } else {
+                    affinity
+                },
             }
         }
     }

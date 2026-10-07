@@ -22,6 +22,7 @@ pub struct FontInfo {
     width: FontWidth,
     style: FontStyle,
     weight: FontWeight,
+    weight_range: Option<(FontWeight, FontWeight)>,
     axes: AxisVec,
     attr_axes: u8,
     charmap_index: CharmapIndex,
@@ -86,6 +87,19 @@ impl FontInfo {
         self.weight
     }
 
+    /// Returns the inclusive matching range supplied at registration, if any.
+    /// A range describes the weights a face advertises, independently of its
+    /// intrinsic visual weight or variation axes.
+    pub fn weight_range(&self) -> Option<(FontWeight, FontWeight)> {
+        self.weight_range
+    }
+
+    pub(crate) fn matching_weight(&self, requested: FontWeight) -> FontWeight {
+        self.weight_range.map_or(self.weight, |(min, max)| {
+            FontWeight::new(requested.value().clamp(min.value(), max.value()))
+        })
+    }
+
     /// Returns synthesis suggestions for this font with the given attributes.
     pub fn synthesis(&self, width: FontWidth, style: FontStyle, weight: FontWeight) -> Synthesis {
         let mut synth = Synthesis::default();
@@ -104,11 +118,16 @@ impl FontInfo {
         // 2. A non-conformant font specifies different weights in its OS/2 and `fvar` tables.
         //      - See: <https://learn.microsoft.com/en-us/typography/opentype/spec/dvaraxistag_wght#additional-information>
         if let Some(weight_axis) = self.axes.iter().find(|axis| axis.tag == Tag::new(b"wght")) {
-            if weight_axis.default != weight.value() {
-                synth.vars[len] = (Tag::new(b"wght"), weight.value());
+            let axis_weight = if self.weight_range.is_some() {
+                self.matching_weight(weight)
+            } else {
+                weight
+            };
+            if weight_axis.default != axis_weight.value() {
+                synth.vars[len] = (Tag::new(b"wght"), axis_weight.value());
                 len += 1;
             }
-        } else if weight.value() > self.weight.value() + 200.0 {
+        } else if weight.value() > self.matching_weight(weight).value() + 200.0 {
             synth.embolden = true;
         }
         if self.style != style {
@@ -252,6 +271,7 @@ impl FontInfo {
             width,
             style,
             weight,
+            weight_range: None,
             axes,
             attr_axes,
             charmap_index,
@@ -285,6 +305,14 @@ impl FontInfo {
         }
         if let Some(weight) = info_override.weight {
             self.weight = weight;
+        }
+        if let Some((min, max)) = info_override.weight_range {
+            if min.value().is_finite() && max.value().is_finite() {
+                self.weight_range = Some((
+                    FontWeight::new(min.value().min(max.value())),
+                    FontWeight::new(min.value().max(max.value())),
+                ));
+            }
         }
         if let Some(axes) = info_override.axes {
             // This is O(n^2) but no font should have enough axes for that to
@@ -483,6 +511,11 @@ pub struct FontInfoOverride<'a> {
     pub style: Option<FontStyle>,
     /// Font weight to be used instead of the one specified in the font itself.
     pub weight: Option<FontWeight>,
+    /// Inclusive weight range used for face matching. Static faces are not
+    /// emboldened for requests inside this range; variable weight instances are
+    /// clamped to it. Reversed endpoints are normalized and nonfinite ranges
+    /// ignored. When absent, the existing single-weight behavior is retained.
+    pub weight_range: Option<(FontWeight, FontWeight)>,
     /// Default values for the font's variation axes. Axes not included within
     /// the font will be ignored.
     pub axes: Option<&'a [(Tag, f32)]>,
@@ -491,6 +524,7 @@ pub struct FontInfoOverride<'a> {
 #[cfg(test)]
 mod tests {
     use alloc::sync::Arc;
+    use alloc::vec::Vec;
 
     use super::*;
     use crate::SourceId;
@@ -558,5 +592,104 @@ mod tests {
         );
         assert!(synthesis.embolden());
         assert!(synthesis.variation_settings().is_empty());
+    }
+
+    #[test]
+    fn static_face_range_does_not_synthesize_weights_it_advertises() {
+        let mut font = font_info(ROBOTO);
+        font.apply_override(&FontInfoOverride {
+            weight_range: Some((FontWeight::new(100.0), FontWeight::new(900.0))),
+            ..Default::default()
+        });
+        for weight in [100.0, 400.0, 450.5, 700.0, 900.0] {
+            assert!(
+                !font
+                    .synthesis(font.width(), font.style(), FontWeight::new(weight))
+                    .any()
+            );
+        }
+        font.apply_override(&FontInfoOverride {
+            weight_range: Some((FontWeight::new(200.0), FontWeight::new(400.0))),
+            ..Default::default()
+        });
+        assert!(
+            font.synthesis(font.width(), font.style(), FontWeight::BOLD)
+                .embolden()
+        );
+    }
+
+    #[test]
+    fn variable_face_range_clamps_axis_instances() {
+        let mut font = font_info(ROBOTO_FLEX);
+        font.apply_override(&FontInfoOverride {
+            weight_range: Some((FontWeight::new(300.0), FontWeight::new(600.0))),
+            ..Default::default()
+        });
+        for (request, instance) in [(100.0, 300.0), (450.5, 450.5), (900.0, 600.0)] {
+            let synth = font.synthesis(font.width(), font.style(), FontWeight::new(request));
+            assert_eq!(synth.variation_settings(), &[(Tag::new(b"wght"), instance)]);
+            assert!(!synth.embolden());
+        }
+    }
+
+    #[test]
+    fn face_range_matching_obeys_css_weight_search_order() {
+        let fonts: Vec<_> = [(100.0, 300.0), (500.0, 700.0), (900.0, 950.0)]
+            .into_iter()
+            .map(|(min, max)| {
+                let mut font = font_info(ROBOTO);
+                font.apply_override(&FontInfoOverride {
+                    weight_range: Some((FontWeight::new(min), FontWeight::new(max))),
+                    ..Default::default()
+                });
+                font
+            })
+            .collect();
+        for (request, expected) in [
+            (250.0, 0),
+            (301.0, 0),
+            (400.0, 1),
+            (450.5, 1),
+            (650.0, 1),
+            (800.0, 2),
+            (1000.0, 2),
+        ] {
+            assert_eq!(
+                crate::matching::match_font(
+                    &fonts,
+                    FontWidth::NORMAL,
+                    FontStyle::Normal,
+                    FontWeight::new(request),
+                    false
+                ),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn overlapping_ranges_remain_available_for_subset_fallback() {
+        let fonts: Vec<_> = [(100.0, 500.0), (300.0, 700.0), (600.0, 900.0)]
+            .into_iter()
+            .map(|(min, max)| {
+                let mut font = font_info(ROBOTO);
+                font.apply_override(&FontInfoOverride {
+                    weight_range: Some((FontWeight::new(min), FontWeight::new(max))),
+                    ..Default::default()
+                });
+                font
+            })
+            .collect();
+        assert_eq!(
+            crate::matching::match_fonts(
+                &fonts,
+                FontWidth::NORMAL,
+                FontStyle::Normal,
+                FontWeight::NORMAL,
+                false
+            )
+            .collect::<Vec<_>>(),
+            [0, 1]
+        );
     }
 }

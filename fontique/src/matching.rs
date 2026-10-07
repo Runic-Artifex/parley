@@ -18,12 +18,14 @@ pub(crate) fn match_fonts(
 ) -> impl Iterator<Item = usize> + '_ {
     let best = match_font(set, width, style, weight, synthesize_style).map(|index| {
         let font = &set[index];
-        (font.width(), font.style(), font.weight())
+        (font.width(), font.style(), font.matching_weight(weight))
     });
     set.iter().enumerate().filter_map(move |(index, font)| {
         let (best_width, best_style, best_weight) = best?;
         // We need to return each font with the best attributes, as there might be multiple subsets.
-        (font.width() == best_width && font.style() == best_style && font.weight() == best_weight)
+        (font.width() == best_width
+            && font.style() == best_style
+            && font.matching_weight(weight) == best_weight)
             .then_some(index)
     })
 }
@@ -56,7 +58,7 @@ pub fn match_font(
             index: i,
             width: (font.width().ratio() * 100.0) as i32,
             style: font.style(),
-            weight: font.weight().value(),
+            weight: font.matching_weight(weight).value(),
             has_slnt: font.has_slant_axis(),
         })
         .collect();

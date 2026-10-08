@@ -9,7 +9,7 @@ use super::style::{Brush, StyleProperty, TextStyle};
 
 use super::layout::Layout;
 
-use alloc::string::String;
+use alloc::{string::String, vec::Vec};
 use core::ops::{Bound, Range, RangeBounds};
 use parlance::BaseDirection;
 use parley_engine::break_overrides::LineBreakOverrideFn;
@@ -245,6 +245,19 @@ pub struct TreeBuilder<'a, B: Brush> {
     pub(crate) fcx: &'a mut FontContext,
 }
 
+/// A normalized UTF-8 byte range attributed to an opaque caller-provided source.
+///
+/// Source ids are metadata only: they do not introduce style or shaping boundaries.
+/// Ranges are nonempty, half-open, sorted and nonoverlapping; untagged output may
+/// leave gaps between them. Zero is a valid source id.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextSourceRange {
+    /// Half-open UTF-8 byte bounds in normalized output text.
+    pub range: Range<usize>,
+    /// Opaque caller-provided identity, including zero.
+    pub source: u64,
+}
+
 impl<'b, B: Brush> TreeBuilder<'b, B> {
     pub fn push_style_span(&mut self, style: TextStyle<'_, '_, B>) {
         let resolved = self
@@ -276,6 +289,17 @@ impl<'b, B: Brush> TreeBuilder<'b, B> {
 
     pub fn push_text(&mut self, text: &str) {
         self.lcx.tree_style_builder.push_text(text);
+    }
+
+    /// Pushes text with optional provenance retained through whitespace processing.
+    ///
+    /// Removed whitespace produces no range. A collapsed space belongs to the first
+    /// contributing source. Unattributed text pushed with [`Self::push_text`] is omitted
+    /// from the source map returned by [`Self::build_into_with_sources`].
+    pub fn push_text_with_source(&mut self, text: &str, source: u64) {
+        self.lcx
+            .tree_style_builder
+            .push_text_with_source(text, source);
     }
 
     pub fn push_inline_box(&mut self, mut inline_box: InlineBox) {
@@ -322,11 +346,23 @@ impl<'b, B: Brush> TreeBuilder<'b, B> {
             .lcx
             .tree_style_builder
             .finish(&mut self.lcx.style_table, &mut self.lcx.style_runs);
+        self.lcx.tree_style_builder.take_sources();
 
         // Call generic layout builder method
         build_into_layout(layout, &text, self.lcx, self.fcx, self.options);
 
         text
+    }
+
+    /// Builds a layout and returns text provenance in the normalized text's byte space.
+    pub fn build_into_with_sources(self, layout: &mut Layout<B>) -> (String, Vec<TextSourceRange>) {
+        let text = self
+            .lcx
+            .tree_style_builder
+            .finish(&mut self.lcx.style_table, &mut self.lcx.style_runs);
+        let sources = self.lcx.tree_style_builder.take_sources();
+        build_into_layout(layout, &text, self.lcx, self.fcx, self.options);
+        (text, sources)
     }
 
     #[inline]

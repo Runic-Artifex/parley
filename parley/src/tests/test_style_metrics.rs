@@ -20,6 +20,67 @@ fn root_style() -> TextStyle<'static, 'static, ColorBrush> {
     }
 }
 
+#[test]
+fn source_metadata_keeps_ligatures_bidi_and_positioned_glyphs_unchanged() {
+    let mut fcx = create_font_context();
+    let mut lcx = LayoutContext::<ColorBrush>::new();
+    let mut plain = lcx.tree_builder(&mut fcx, 1., false, &root_style());
+    plain.push_text("of");
+    plain.push_text("fice אבג");
+    plain.push_style_modification_span(&[StyleProperty::Brush(ColorBrush::new(
+        peniko::Color::WHITE,
+    ))]);
+    plain.push_text(" XYZ");
+    plain.pop_style_span();
+    let (mut expected, text) = plain.build();
+    expected.break_all_lines(Some(95.));
+
+    let mut tagged = lcx.tree_builder(&mut fcx, 1., false, &root_style());
+    tagged.push_text_with_source("of", 0);
+    tagged.push_text_with_source("fice אבג", 1);
+    tagged.push_style_modification_span(&[StyleProperty::Brush(ColorBrush::new(
+        peniko::Color::WHITE,
+    ))]);
+    tagged.push_text_with_source(" XYZ", 2);
+    tagged.pop_style_span();
+    let mut actual = Layout::default();
+    let (actual_text, sources) = tagged.build_into_with_sources(&mut actual);
+    actual.break_all_lines(Some(95.));
+    assert_eq!(actual_text, text);
+    assert_eq!(sources.len(), 3);
+    let signature = |layout: &Layout<ColorBrush>| {
+        layout
+            .lines()
+            .flat_map(|line| line.items())
+            .filter_map(|item| match item {
+                crate::PositionedLayoutItem::GlyphRun(run) => {
+                    let range = run.text_range();
+                    assert!(
+                        !range.is_empty()
+                            && text.is_char_boundary(range.start)
+                            && text.is_char_boundary(range.end)
+                    );
+                    assert!(
+                        run.run().text_range().start <= range.start
+                            && range.end <= run.run().text_range().end
+                    );
+                    Some((
+                        run.style_index(),
+                        range,
+                        run.offset(),
+                        run.advance(),
+                        run.positioned_glyphs()
+                            .map(|glyph| (glyph.id, glyph.x, glyph.y, glyph.advance))
+                            .collect::<alloc::vec::Vec<_>>(),
+                    ))
+                }
+                _ => None,
+            })
+            .collect::<alloc::vec::Vec<_>>()
+    };
+    assert_eq!(signature(&actual), signature(&expected));
+}
+
 /// Root style with three spans: `A` (40px) containing `B` (10px, `vertical-align: super`) and a
 /// sibling `top` aligned span `C` containing `D`.
 fn build() -> Layout<ColorBrush> {

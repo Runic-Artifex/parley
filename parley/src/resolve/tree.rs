@@ -4,7 +4,11 @@
 //! Hierarchical tree based style application.
 use alloc::{string::String, vec::Vec};
 
-use crate::style::{TextWrapMode, WhiteSpaceCollapse};
+use crate::{
+    TextSourceRange,
+    style::{TextWrapMode, WhiteSpaceCollapse},
+};
+use core::ops::Range;
 
 use super::{Brush, ResolvedProperty, ResolvedStyle, StyleRun};
 
@@ -26,6 +30,7 @@ struct PendingWhitespace {
     /// Whether any of the collapsed whitespace came from a span that allows wrapping, in which
     /// case the collapsed space is a soft wrap opportunity.
     wrappable: bool,
+    source: Option<u64>,
 }
 
 /// Whether `c` is a segment break, i.e. a character which is a forced line break when preserved.
@@ -41,6 +46,8 @@ pub(crate) struct TreeStyleBuilder<B: Brush> {
     style_runs: Vec<StyleRun>,
     text: String,
     uncommitted_text: String,
+    uncommitted_sources: Vec<TextSourceRange>,
+    sources: Vec<TextSourceRange>,
     current_span: usize,
     /// The span that a not-yet-committed collapsible whitespace sequence belongs to.
     ///
@@ -61,6 +68,8 @@ impl<B: Brush> Default for TreeStyleBuilder<B> {
             style_runs: Vec::new(),
             text: String::new(),
             uncommitted_text: String::new(),
+            uncommitted_sources: Vec::new(),
+            sources: Vec::new(),
             current_span: usize::MAX,
             pending_whitespace: None,
             last_item_is_inline_box: false,
@@ -83,6 +92,8 @@ impl<B: Brush> TreeStyleBuilder<B> {
         self.style_runs.clear();
         self.text.clear();
         self.uncommitted_text.clear();
+        self.uncommitted_sources.clear();
+        self.sources.clear();
         self.pending_whitespace = None;
         self.last_item_is_inline_box = false;
 
@@ -110,6 +121,7 @@ impl<B: Brush> TreeStyleBuilder<B> {
     /// trailing collapsible whitespace pending.
     pub(crate) fn commit_uncommitted_text(&mut self) {
         let uncommitted_text = core::mem::take(&mut self.uncommitted_text);
+        let sources = core::mem::take(&mut self.uncommitted_sources);
         if uncommitted_text.is_empty() {
             return;
         }
@@ -124,7 +136,12 @@ impl<B: Brush> TreeStyleBuilder<B> {
                     self.pending_whitespace = None;
                 }
                 self.flush_pending_whitespace();
-                self.commit_text(span, &uncommitted_text);
+                self.commit_text_with_sources(
+                    span,
+                    &uncommitted_text,
+                    0..uncommitted_text.len(),
+                    &sources,
+                );
             }
             mode @ (WhiteSpaceCollapse::Collapse | WhiteSpaceCollapse::PreserveBreaks) => {
                 let mut rest = uncommitted_text.as_str();
@@ -136,9 +153,20 @@ impl<B: Brush> TreeStyleBuilder<B> {
                         // started in, but is a wrap opportunity if any of the spans it collapses
                         // whitespace from allows wrapping.
                         let wrappable = self.tree[span].style.text_wrap_mode == TextWrapMode::Wrap;
-                        let pending = self
-                            .pending_whitespace
-                            .get_or_insert(PendingWhitespace { span, wrappable });
+                        let pending =
+                            self.pending_whitespace
+                                .get_or_insert_with(|| PendingWhitespace {
+                                    span,
+                                    wrappable,
+                                    source: sources
+                                        .iter()
+                                        .find(|source| {
+                                            source
+                                                .range
+                                                .contains(&(uncommitted_text.len() - rest.len()))
+                                        })
+                                        .map(|source| source.source),
+                                });
                         pending.wrappable |= wrappable;
                         rest = &rest[whitespace_len..];
                         continue;
@@ -152,7 +180,13 @@ impl<B: Brush> TreeStyleBuilder<B> {
                         // preserved as forced breaks.
                         self.pending_whitespace = None;
                         let break_len = rest.chars().next().unwrap().len_utf8();
-                        self.commit_text(span, &rest[..break_len]);
+                        let start = uncommitted_text.len() - rest.len();
+                        self.commit_text_with_sources(
+                            span,
+                            &rest[..break_len],
+                            start..start + break_len,
+                            &sources,
+                        );
                         rest = &rest[break_len..];
                         continue;
                     }
@@ -160,7 +194,13 @@ impl<B: Brush> TreeStyleBuilder<B> {
                         .find(|c| mode.is_collapsible(c) || is_segment_break(c))
                         .unwrap_or(rest.len());
                     self.flush_pending_whitespace();
-                    self.commit_text(span, &rest[..text_len]);
+                    let start = uncommitted_text.len() - rest.len();
+                    self.commit_text_with_sources(
+                        span,
+                        &rest[..text_len],
+                        start..start + text_len,
+                        &sources,
+                    );
                     rest = &rest[text_len..];
                 }
             }
@@ -187,7 +227,11 @@ impl<B: Brush> TreeStyleBuilder<B> {
         } else {
             self.resolve_style_id(pending.span)
         };
+        let start = self.text.len();
         self.commit_styled_text(style_index, " ");
+        if let Some(source) = pending.source {
+            self.record_source(start..start + 1, source);
+        }
     }
 
     /// The style table index of the span that text is currently being pushed into.
@@ -196,9 +240,42 @@ impl<B: Brush> TreeStyleBuilder<B> {
     }
 
     /// Appends already white space processed `text` to the buffer, attributed to `span`.
-    fn commit_text(&mut self, span: usize, text: &str) {
+    fn commit_text_with_sources(
+        &mut self,
+        span: usize,
+        text: &str,
+        input: Range<usize>,
+        sources: &[TextSourceRange],
+    ) {
         let style_index = self.resolve_style_id(span);
+        let output_start = self.text.len();
         self.commit_styled_text(style_index, text);
+        for source in sources {
+            let start = input.start.max(source.range.start);
+            let end = input.end.min(source.range.end);
+            if start < end {
+                self.record_source(
+                    output_start + start - input.start..output_start + end - input.start,
+                    source.source,
+                );
+            }
+        }
+    }
+
+    fn record_source(&mut self, range: Range<usize>, source: u64) {
+        if let Some(last) = self
+            .sources
+            .last_mut()
+            .filter(|last| last.source == source && last.range.end == range.start)
+        {
+            last.range.end = range.end;
+        } else {
+            self.sources.push(TextSourceRange { range, source });
+        }
+    }
+
+    pub(crate) fn take_sources(&mut self) -> Vec<TextSourceRange> {
+        core::mem::take(&mut self.sources)
     }
 
     /// Appends already white space processed `text` to the buffer with the given style.
@@ -303,6 +380,17 @@ impl<B: Brush> TreeStyleBuilder<B> {
         self.uncommitted_text.push_str(text);
     }
 
+    pub(crate) fn push_text_with_source(&mut self, text: &str, source: u64) {
+        let start = self.uncommitted_text.len();
+        self.push_text(text);
+        if !text.is_empty() {
+            self.uncommitted_sources.push(TextSourceRange {
+                range: start..start + text.len(),
+                source,
+            });
+        }
+    }
+
     /// Computes style table + style runs and returns the final text buffer.
     pub(crate) fn finish(
         &mut self,
@@ -337,6 +425,68 @@ mod tests {
     use super::*;
     use alloc::vec::Vec;
     use core::ops::Range;
+
+    #[test]
+    fn source_boundaries_do_not_change_normalization_or_style_runs() {
+        for mode in [
+            WhiteSpaceCollapse::Collapse,
+            WhiteSpaceCollapse::PreserveBreaks,
+            WhiteSpaceCollapse::Preserve,
+            WhiteSpaceCollapse::BreakSpaces,
+        ] {
+            let input = " \t\u{00e9} f\r\n fi\n\u{2028} \u{00a0}B \t";
+            for split in (0..=input.len()).filter(|&i| input.is_char_boundary(i)) {
+                let style = ResolvedStyle {
+                    white_space_collapse: mode,
+                    ..ResolvedStyle::default()
+                };
+                let mut plain = TreeStyleBuilder::<u32>::default();
+                plain.begin(style.clone());
+                plain.push_text(&input[..split]);
+                plain.push_text(&input[split..]);
+                let mut plain_styles = Vec::new();
+                let mut plain_runs = Vec::new();
+                let text = plain.finish(&mut plain_styles, &mut plain_runs);
+                let mut tagged = TreeStyleBuilder::<u32>::default();
+                tagged.begin(style);
+                tagged.push_text_with_source(&input[..split], 0);
+                tagged.push_text_with_source(&input[split..], 1);
+                let mut tagged_styles = Vec::new();
+                let mut tagged_runs = Vec::new();
+                assert_eq!(tagged.finish(&mut tagged_styles, &mut tagged_runs), text);
+                assert_eq!(tagged_styles, plain_styles);
+                assert_eq!(
+                    tagged_runs
+                        .iter()
+                        .map(|run| (run.style_index, run.range.clone()))
+                        .collect::<Vec<_>>(),
+                    plain_runs
+                        .iter()
+                        .map(|run| (run.style_index, run.range.clone()))
+                        .collect::<Vec<_>>()
+                );
+                let sources = tagged.take_sources();
+                assert_eq!(
+                    sources
+                        .iter()
+                        .map(|source| source.range.len())
+                        .sum::<usize>(),
+                    text.len()
+                );
+                assert!(
+                    sources
+                        .iter()
+                        .all(|source| text.is_char_boundary(source.range.start)
+                            && text.is_char_boundary(source.range.end))
+                );
+                assert!(
+                    sources
+                        .windows(2)
+                        .all(|pair| pair[0].range.end == pair[1].range.start)
+                );
+            }
+        }
+    }
 
     #[test]
     fn preserve_breaks_collapses_across_text_and_style_boundaries() {
@@ -398,6 +548,150 @@ mod tests {
         assert_eq!(style.brush, 1);
         assert_eq!(style.text_wrap_mode, TextWrapMode::Wrap);
         assert_eq!(style.white_space_collapse, WhiteSpaceCollapse::Collapse);
+    }
+
+    #[test]
+    fn sources_keep_adjacent_same_style_text_separate() {
+        let mut builder = TreeStyleBuilder::<u32>::default();
+        builder.begin(ResolvedStyle::default());
+        builder.push_text_with_source("A", 1);
+        builder.push_text_with_source("\u{00e9}", 2);
+
+        let text = builder.finish(&mut Vec::new(), &mut Vec::new());
+        assert_eq!(text, "A\u{00e9}");
+        assert_eq!(
+            builder.take_sources(),
+            Vec::from([
+                TextSourceRange {
+                    range: 0..1,
+                    source: 1,
+                },
+                TextSourceRange {
+                    range: 1..3,
+                    source: 2,
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn sources_use_normalized_output_bytes_for_transformed_non_ascii_text() {
+        let mut builder = TreeStyleBuilder::<u32>::default();
+        builder.begin(ResolvedStyle::default());
+
+        // Text transforms happen in the caller. The map intentionally describes
+        // their output rather than pretending it still has source-text offsets.
+        let transformed = "\u{00df}\u{00e9}".to_uppercase();
+        builder.push_text_with_source(&transformed, 41);
+
+        let text = builder.finish(&mut Vec::new(), &mut Vec::new());
+        assert_eq!(text, "SS\u{00c9}");
+        assert_eq!(
+            builder.take_sources(),
+            Vec::from([TextSourceRange {
+                range: 0..text.len(),
+                source: 41,
+            }])
+        );
+    }
+
+    #[test]
+    fn sources_follow_pending_whitespace_across_collapse_and_preserve_modes() {
+        let mut builder = TreeStyleBuilder::<u32>::default();
+        builder.begin(ResolvedStyle {
+            white_space_collapse: WhiteSpaceCollapse::Collapse,
+            ..ResolvedStyle::default()
+        });
+        builder.push_text_with_source("A ", 10);
+        builder.push_style_modification_span(
+            [ResolvedProperty::WhiteSpaceCollapse(
+                WhiteSpaceCollapse::PreserveBreaks,
+            )]
+            .into_iter(),
+        );
+        builder.push_text_with_source("\tB", 20);
+        builder.pop_style_span();
+        builder.push_style_modification_span(
+            [ResolvedProperty::WhiteSpaceCollapse(
+                WhiteSpaceCollapse::Preserve,
+            )]
+            .into_iter(),
+        );
+        builder.push_text_with_source("\nC", 30);
+
+        let text = builder.finish(&mut Vec::new(), &mut Vec::new());
+        assert_eq!(text, "A B\nC");
+        assert_eq!(
+            builder.take_sources(),
+            Vec::from([
+                TextSourceRange {
+                    range: 0..2,
+                    source: 10,
+                },
+                TextSourceRange {
+                    range: 2..3,
+                    source: 20,
+                },
+                TextSourceRange {
+                    range: 3..5,
+                    source: 30,
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn sources_leave_synthetic_text_and_atomic_boundaries_unattributed() {
+        let mut builder = TreeStyleBuilder::<u32>::default();
+        builder.begin(ResolvedStyle {
+            white_space_collapse: WhiteSpaceCollapse::Collapse,
+            ..ResolvedStyle::default()
+        });
+        builder.push_text_with_source("A ", 1);
+        builder.commit_uncommitted_text();
+        builder.flush_pending_whitespace();
+        // This is the normalizer state after an atomic inline item. It owns no
+        // normalized text range itself, but prevents following whitespace from
+        // becoming initial whitespace.
+        builder.set_last_item_is_inline_box();
+        builder.push_text(" ");
+        builder.push_text_with_source("B", 2);
+
+        let text = builder.finish(&mut Vec::new(), &mut Vec::new());
+        assert_eq!(text, "A  B");
+        assert_eq!(
+            builder.take_sources(),
+            Vec::from([
+                TextSourceRange {
+                    range: 0..2,
+                    source: 1,
+                },
+                TextSourceRange {
+                    range: 3..4,
+                    source: 2,
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn begin_clears_sources_before_reusing_the_builder() {
+        let mut builder = TreeStyleBuilder::<u32>::default();
+        builder.begin(ResolvedStyle::default());
+        builder.push_text_with_source("old", 1);
+        assert_eq!(builder.finish(&mut Vec::new(), &mut Vec::new()), "old");
+        assert_eq!(builder.take_sources().len(), 1);
+
+        builder.begin(ResolvedStyle::default());
+        builder.push_text_with_source("new", 2);
+        assert_eq!(builder.finish(&mut Vec::new(), &mut Vec::new()), "new");
+        assert_eq!(
+            builder.take_sources(),
+            Vec::from([TextSourceRange {
+                range: 0..3,
+                source: 2,
+            }])
+        );
     }
 
     #[test]

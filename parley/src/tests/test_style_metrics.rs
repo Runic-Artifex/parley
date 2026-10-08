@@ -117,6 +117,398 @@ fn metrics(layout: &Layout<ColorBrush>) -> &[StyleMetrics] {
     &layout.data.style_metrics
 }
 
+fn assert_close(actual: f32, expected: f32) {
+    assert!(
+        (actual - expected).abs() < 1e-4,
+        "expected {expected}, got {actual}"
+    );
+}
+
+/// The line-box union of `outer` and parent-relative descendant spans, relative to the outer
+/// baseline. `top`/`bottom` subtrees deliberately do not appear in this set.
+fn span_union(layout: &Layout<ColorBrush>, outer: usize, descendants: &[usize]) -> (f32, f32) {
+    let styles = metrics(layout);
+    let outer_metrics = styles[outer];
+    descendants.iter().fold(
+        (outer_metrics.over, outer_metrics.under),
+        |(over, under), &descendant| {
+            let child = styles[descendant];
+            let shift = child.exact_baseline_offset - outer_metrics.exact_baseline_offset;
+            (over.max(child.over + shift), under.max(child.under - shift))
+        },
+    )
+}
+
+/// A `middle` span's complete parent-relative union is centered at half the parent's x-height,
+/// rather than centering only the outer span before considering descendants.
+fn assert_middle_union(
+    layout: &Layout<ColorBrush>,
+    line_index: usize,
+    outer: usize,
+    descendants: &[usize],
+) {
+    let line = layout.get(line_index).unwrap();
+    let (over, under) = span_union(layout, outer, descendants);
+    let union_center = line.style_baseline(outer as u16) + (under - over) / 2.;
+    let target_center = line.style_baseline(0) - metrics(layout)[0].x_height / 2.;
+    assert_close(union_center, target_center);
+}
+
+fn line_has_style(layout: &Layout<ColorBrush>, line_index: usize, style_index: u16) -> bool {
+    layout
+        .get(line_index)
+        .unwrap()
+        .items()
+        .filter_map(|item| match item {
+            crate::PositionedLayoutItem::GlyphRun(run) => Some(run),
+            _ => None,
+        })
+        .any(|run| run.style_index() == style_index)
+}
+
+fn middle_descendant_layout(direct_outer_text: bool) -> Layout<ColorBrush> {
+    let mut fcx = create_font_context();
+    let mut lcx = LayoutContext::new();
+    let root = root_style();
+    let mut builder = lcx.tree_builder(&mut fcx, 1., true, &root);
+    builder.set_quantization_mode(QuantizationMode::Logical);
+    builder.push_style_span(TextStyle {
+        font_size: 14.,
+        line_height: LineHeight::Absolute(18.),
+        vertical_align: VerticalAlign::MIDDLE,
+        ..root_style()
+    });
+    if direct_outer_text {
+        builder.push_text("outer");
+    }
+    builder.push_style_span(TextStyle {
+        font_size: 40.,
+        line_height: LineHeight::Absolute(48.),
+        vertical_align: VerticalAlign::length(11.),
+        ..root_style()
+    });
+    builder.push_text("x");
+    builder.pop_style_span();
+    builder.pop_style_span();
+    let (mut layout, _) = builder.build();
+    layout.break_all_lines(None);
+    layout
+}
+
+fn wrapped_middle_descendant_layout(max_advance: Option<f32>) -> Layout<ColorBrush> {
+    let mut fcx = create_font_context();
+    let mut lcx = LayoutContext::new();
+    let root = root_style();
+    let mut builder = lcx.tree_builder(&mut fcx, 1., true, &root);
+    builder.set_quantization_mode(QuantizationMode::Logical);
+    builder.push_style_span(TextStyle {
+        font_size: 14.,
+        line_height: LineHeight::Absolute(18.),
+        vertical_align: VerticalAlign::MIDDLE,
+        ..root_style()
+    });
+    builder.push_style_span(TextStyle {
+        font_size: 32.,
+        line_height: LineHeight::Absolute(42.),
+        vertical_align: VerticalAlign::length(9.),
+        ..root_style()
+    });
+    builder.push_text("x ");
+    builder.pop_style_span();
+    builder.push_style_span(TextStyle {
+        font_size: 12.,
+        line_height: LineHeight::Absolute(14.),
+        vertical_align: VerticalAlign::length(-3.),
+        ..root_style()
+    });
+    builder.push_text("xx");
+    builder.pop_style_span();
+    builder.pop_style_span();
+    let (mut layout, _) = builder.build();
+    layout.break_all_lines(max_advance);
+    layout
+}
+
+#[test]
+fn logical_middle_aligns_descendant_union_before_outer_box() {
+    let direct = middle_descendant_layout(true);
+    let textless = middle_descendant_layout(false);
+
+    assert_middle_union(&direct, 0, 1, &[2]);
+    assert_middle_union(&textless, 0, 1, &[2]);
+
+    let direct_line = direct.get(0).unwrap();
+    let textless_line = textless.get(0).unwrap();
+    // An ancestor span is present even with no direct glyphs, so its union and alignment do not
+    // depend on whether it has its own text atom.
+    assert_close(
+        direct_line.style_baseline(0) - direct_line.style_baseline(1),
+        textless_line.style_baseline(0) - textless_line.style_baseline(1),
+    );
+    assert_close(
+        direct_line.metrics().line_height,
+        textless_line.metrics().line_height,
+    );
+}
+
+#[test]
+fn logical_middle_uses_each_wrapped_line_descendant_union() {
+    let unwrapped = wrapped_middle_descendant_layout(None);
+    let first = unwrapped
+        .get(0)
+        .unwrap()
+        .items()
+        .filter_map(|item| match item {
+            crate::PositionedLayoutItem::GlyphRun(run) => Some(run),
+            _ => None,
+        })
+        .find(|run| run.style_index() == 2)
+        .unwrap()
+        .advance();
+    let second = unwrapped
+        .get(0)
+        .unwrap()
+        .items()
+        .filter_map(|item| match item {
+            crate::PositionedLayoutItem::GlyphRun(run) => Some(run),
+            _ => None,
+        })
+        .find(|run| run.style_index() == 3)
+        .unwrap()
+        .advance();
+    let layout = wrapped_middle_descendant_layout(Some(first + second / 2.));
+    assert_eq!(layout.len(), 2);
+    assert!(line_has_style(&layout, 0, 2));
+    assert!(line_has_style(&layout, 1, 3));
+
+    assert_middle_union(&layout, 0, 1, &[2]);
+    assert_middle_union(&layout, 1, 1, &[3]);
+    let first_offset =
+        layout.get(0).unwrap().style_baseline(0) - layout.get(0).unwrap().style_baseline(1);
+    let second_offset =
+        layout.get(1).unwrap().style_baseline(0) - layout.get(1).unwrap().style_baseline(1);
+    assert_ne!(first_offset, second_offset);
+}
+
+#[test]
+fn logical_middle_excludes_nested_top_and_bottom_subtrees() {
+    let mut fcx = create_font_context();
+    let mut lcx = LayoutContext::new();
+    let root = root_style();
+    let mut builder = lcx.tree_builder(&mut fcx, 1., true, &root);
+    builder.set_quantization_mode(QuantizationMode::Logical);
+    builder.push_style_span(TextStyle {
+        font_size: 14.,
+        line_height: LineHeight::Absolute(18.),
+        vertical_align: VerticalAlign::MIDDLE,
+        ..root_style()
+    });
+    builder.push_text("outer");
+    for align in [VerticalAlign::TOP, VerticalAlign::BOTTOM] {
+        builder.push_style_span(TextStyle {
+            font_size: 40.,
+            line_height: LineHeight::Absolute(48.),
+            vertical_align: align,
+            ..root_style()
+        });
+        builder.push_text("x");
+        builder.pop_style_span();
+    }
+    builder.pop_style_span();
+    let (mut layout, _) = builder.build();
+    layout.break_all_lines(None);
+
+    let line = layout.get(0).unwrap();
+    let outer = metrics(&layout)[1];
+    let expected_offset = metrics(&layout)[0].x_height / 2. - (outer.over - outer.under) / 2.;
+    assert_close(
+        line.style_baseline(0) - line.style_baseline(1),
+        expected_offset,
+    );
+    assert_middle_union(&layout, 0, 1, &[]);
+}
+
+#[test]
+fn logical_middle_includes_nested_atomic_box_and_replays_breaking() {
+    let mut fcx = create_font_context();
+    let mut lcx = LayoutContext::new();
+    let root = root_style();
+    let mut builder = lcx.tree_builder(&mut fcx, 1., true, &root);
+    builder.set_quantization_mode(QuantizationMode::Logical);
+    builder.push_style_span(TextStyle {
+        font_size: 14.,
+        line_height: LineHeight::Absolute(18.),
+        vertical_align: VerticalAlign::MIDDLE,
+        ..root_style()
+    });
+    builder.push_text("outer ");
+    builder.push_inline_box(InlineBox {
+        id: 9,
+        kind: InlineBoxKind::InFlow,
+        index: 0,
+        width: 12.,
+        height: 60.,
+        baseline: Some(45.),
+        vertical_align: VerticalAlign::length(4.),
+    });
+    builder.pop_style_span();
+    let (mut layout, _) = builder.build();
+    layout.break_all_lines(None);
+
+    let line = layout.get(0).unwrap();
+    let outer = metrics(&layout)[1];
+    let outer_baseline = line.style_baseline(1);
+    let atomic_top = line.inline_box_top(0);
+    let atomic_bottom = atomic_top + layout.inline_boxes().next().unwrap().height;
+    let over = outer.over.max(outer_baseline - atomic_top);
+    let under = outer.under.max(atomic_bottom - outer_baseline);
+    let union_center = outer_baseline + (under - over) / 2.;
+    let target_center = line.style_baseline(0) - metrics(&layout)[0].x_height / 2.;
+    assert_close(union_center, target_center);
+
+    let expected = layout.data.clone();
+    let _intrinsic = layout.calculate_content_widths();
+    layout.break_all_lines(Some(20.));
+    layout.break_all_lines(None);
+    assert_eq!(layout.data, expected);
+}
+
+#[test]
+fn logical_middle_atomic_only_without_root_strut_keeps_atomic_geometry() {
+    let mut fcx = create_font_context();
+    let mut lcx = LayoutContext::new();
+    let root = root_style();
+    let mut builder = lcx.tree_builder(&mut fcx, 1., true, &root);
+    builder.set_quantization_mode(QuantizationMode::Logical);
+    builder.push_inline_box(InlineBox {
+        id: 1,
+        kind: InlineBoxKind::InFlow,
+        index: 0,
+        width: 10.,
+        height: 37.,
+        baseline: None,
+        vertical_align: VerticalAlign::BASELINE,
+    });
+    let (mut layout, _) = builder.build();
+    layout.set_include_root_strut(false);
+    layout.break_all_lines(None);
+    let line = layout.get(0).unwrap();
+    assert_eq!(line.metrics().line_height, 37.);
+    assert_eq!(line.inline_box_top(0), 0.);
+}
+
+#[test]
+fn logical_alignment_keeps_custom_root_box_after_state_revert() {
+    let mut fcx = create_font_context();
+    let mut lcx = LayoutContext::new();
+    // The participating text boxes fit inside the caller's 45/5 root extents.
+    let root = TextStyle {
+        line_height: LineHeight::Absolute(12.),
+        ..root_style()
+    };
+    let mut builder = lcx.tree_builder(&mut fcx, 1., true, &root);
+    builder.set_quantization_mode(QuantizationMode::Logical);
+    builder.push_inline_box(InlineBox {
+        id: 42,
+        kind: InlineBoxKind::CustomOutOfFlow,
+        index: 0,
+        width: 0.,
+        height: 0.,
+        baseline: None,
+        vertical_align: VerticalAlign::BASELINE,
+    });
+    builder.push_style_span(TextStyle {
+        font_size: 14.,
+        line_height: LineHeight::Absolute(18.),
+        vertical_align: VerticalAlign::MIDDLE,
+        ..root_style()
+    });
+    builder.push_text("x");
+    builder.pop_style_span();
+    let (mut layout, _) = builder.build();
+    layout.set_include_root_strut(false);
+
+    let mut breaker = layout.break_lines();
+    assert!(matches!(
+        breaker.break_next(),
+        Some(crate::YieldData::InlineBoxBreak(_))
+    ));
+    breaker.state_mut().append_inline_box_to_line(0., 45., 5.);
+    let saved = breaker.state().clone();
+    breaker.state_mut().append_inline_box_to_line(0., 90., 10.);
+    breaker.revert_to(saved);
+    assert!(breaker.break_next().is_some());
+    breaker.finish();
+
+    assert_eq!(layout.len(), 1);
+    assert_eq!(layout.get(0).unwrap().metrics().line_height, 50.);
+}
+
+#[test]
+fn logical_alignment_is_restored_after_reverting_to_default_state() {
+    let mut layout = middle_descendant_layout(true);
+    let mut breaker = layout.break_lines();
+    assert!(breaker.break_next_with_length(1).is_some());
+    breaker.revert_to(crate::BreakerState::default());
+    while breaker.break_next_with_length(u32::MAX).is_some() {}
+    breaker.finish();
+    assert_eq!(layout.len(), 1);
+    assert_middle_union(&layout, 0, 1, &[2]);
+}
+
+#[test]
+fn descendant_middle_keeps_device_default_and_unquantized_compatibility() {
+    // Reuse the collection so font Blob ids are stable across the compared layouts.
+    let mut fcx = create_font_context();
+    let mut lcx = LayoutContext::new();
+    let mut build = |quantize: bool, mode: Option<QuantizationMode>| {
+        let root = root_style();
+        let mut builder = lcx.tree_builder(&mut fcx, 1.25, quantize, &root);
+        if let Some(mode) = mode {
+            builder.set_quantization_mode(mode);
+        }
+        builder.push_style_span(TextStyle {
+            font_size: 14.,
+            line_height: LineHeight::Absolute(18.),
+            vertical_align: VerticalAlign::MIDDLE,
+            ..root_style()
+        });
+        builder.push_style_span(TextStyle {
+            font_size: 40.,
+            line_height: LineHeight::Absolute(48.),
+            vertical_align: VerticalAlign::length(11.),
+            ..root_style()
+        });
+        builder.push_text("x");
+        builder.pop_style_span();
+        builder.pop_style_span();
+        let (mut layout, _) = builder.build();
+        layout.break_all_lines(None);
+        layout
+    };
+
+    let default = build(true, None);
+    let explicit_device = build(true, Some(QuantizationMode::Device));
+    assert_eq!(default.data, explicit_device.data);
+    assert!(default.data.style_baseline_offsets.is_empty());
+    assert_close(
+        default.get(0).unwrap().style_baseline(0) - default.get(0).unwrap().style_baseline(1),
+        metrics(&default)[1].baseline_offset,
+    );
+
+    let unquantized_device = build(false, Some(QuantizationMode::Device));
+    let unquantized_logical = build(false, Some(QuantizationMode::Logical));
+    let mut expected = unquantized_device.data.clone();
+    expected.quantization_mode = QuantizationMode::Logical;
+    assert_eq!(expected, unquantized_logical.data);
+    assert!(unquantized_device.data.style_baseline_offsets.is_empty());
+    assert_close(
+        unquantized_device.get(0).unwrap().style_baseline(0)
+            - unquantized_device.get(0).unwrap().style_baseline(1),
+        metrics(&unquantized_device)[1].baseline_offset,
+    );
+}
+
 /// Exercise a genuine outline whose font has no declared x-height, without adding a binary
 /// fixture. OS/2 version 1 predates sxHeight; all other Roboto tables stay unchanged.
 fn missing_x_height_context() -> crate::FontContext {

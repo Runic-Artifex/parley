@@ -101,6 +101,16 @@ pub(crate) struct LineData {
     /// Empty for lines with only baseline-relative content because the top-level aligned
     /// subtree for each line trivially has an offset of 0
     pub(crate) aligned_subtree_offsets: Range<u32>,
+    /// Logical-policy span baselines resolved from this line's descendant unions.
+    pub(crate) style_baseline_offsets: Range<u32>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct StyleBaselineOffset {
+    pub(crate) style: u16,
+    pub(crate) aligned_subtree: u16,
+    /// Offset above the containing aligned subtree's baseline.
+    pub(crate) baseline_offset: f32,
 }
 
 /// Position of an [aligned subtree] (rooted at a `vertical-align: top | bottom` style) on a line.
@@ -229,6 +239,7 @@ pub(crate) struct LayoutData<B: Brush> {
     ///
     /// Each line owns a contiguous slice ([`LineData::aligned_subtree_offsets`]).
     pub(crate) aligned_subtree_offsets: Vec<AlignedSubtreeOffset>,
+    pub(crate) style_baseline_offsets: Vec<StyleBaselineOffset>,
     /// The width constraint that was used to line break the layout
     pub(crate) layout_max_advance: f32,
     /// The computed width of the layout excluding hanging whitespace
@@ -268,6 +279,7 @@ impl<B: Brush> Default for LayoutData<B> {
             lines: Vec::new(),
             line_items: Vec::new(),
             aligned_subtree_offsets: Vec::new(),
+            style_baseline_offsets: Vec::new(),
             alignment: None,
             layout_max_advance: 0.0,
             indent_amount: 0.0,
@@ -303,6 +315,7 @@ impl<B: Brush> LayoutData<B> {
         self.lines.clear();
         self.line_items.clear();
         self.aligned_subtree_offsets.clear();
+        self.style_baseline_offsets.clear();
         self.alignment = None;
     }
 

@@ -51,6 +51,11 @@ impl Quantization {
         (self.enabled && self.mode == QuantizationMode::Logical).then_some(font_size / self.scale)
     }
 
+    /// Opt-in per-line descendant alignment; legacy policies retain eager offsets.
+    pub(crate) fn uses_line_alignment(self) -> bool {
+        self.enabled && self.mode == QuantizationMode::Logical
+    }
+
     /// Convert a measured logical font metric back to layout units.
     pub(crate) fn scale_font_metric(self, value: f32) -> f32 {
         value * self.scale

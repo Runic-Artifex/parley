@@ -6,6 +6,7 @@
 mod alignment;
 mod cluster;
 mod line;
+mod line_alignment;
 mod line_break;
 mod quantization;
 mod run;

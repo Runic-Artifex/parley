@@ -19,9 +19,10 @@
 //! `<length>`/`<percentage>`), i.e. everything that is aligned relative to its parent's baseline
 //! rather than to the line box. Boxes with `vertical-align: top | bottom` are aligned to the line
 //! box instead, so each of them roots a new aligned subtree. Within a subtree all baselines are
-//! fixed relative to each other, so its extents can be accumulated relative to the root's baseline
-//! while the line is being built; the subtrees are only positioned against each other, and the
-//! line box sized, once the line is complete.
+//! resolved relative to each other. The legacy policies use the eager offsets in this module;
+//! enabled logical layouts instead align each line's descendant unions bottom-up in
+//! `line_alignment`. The subtrees are only positioned against each other, and the line box
+//! sized, once the line is complete.
 //! See <https://drafts.csswg.org/css-inline-3/#aligned-subtree> and CSS 2 §10.8
 //! <https://www.w3.org/TR/CSS22/visudet.html#line-height>.
 

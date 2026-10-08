@@ -15,7 +15,9 @@ use parlance::BaseDirection;
 use parley_engine::break_overrides::LineBreakOverrideFn;
 
 use crate::inline_box::{InlineBox, LayoutInlineBox};
+use crate::resolve::tree::EmptySpan;
 use crate::resolve::{ResolvedStyle, StyleRun};
+use crate::shape::ShapingBoundary;
 use crate::{InlineBoxKind, QuantizationMode};
 
 #[derive(Clone, Copy)]
@@ -104,7 +106,7 @@ impl<'b, B: Brush> RangedBuilder<'b, B> {
             .finish(&mut self.lcx.style_table, &mut self.lcx.style_runs);
 
         // Call generic layout builder method
-        build_into_layout(layout, text.as_ref(), self.lcx, self.fcx, self.options);
+        build_into_layout(layout, text.as_ref(), self.lcx, self.fcx, self.options, &[]);
     }
 
     pub fn build(self, text: impl AsRef<str>) -> Layout<B> {
@@ -227,7 +229,7 @@ impl<'b, B: Brush> StyleRunBuilder<'b, B> {
                 range: 0..0,
             });
         }
-        build_into_layout(layout, text.as_ref(), self.lcx, self.fcx, self.options);
+        build_into_layout(layout, text.as_ref(), self.lcx, self.fcx, self.options, &[]);
     }
 
     pub fn build(self, text: impl AsRef<str>) -> Layout<B> {
@@ -263,7 +265,8 @@ impl<'b, B: Brush> TreeBuilder<'b, B> {
     /// Retains ordinary empty style spans as zero-advance line participants.
     ///
     /// Disabled by default. Modification scopes do not generate participants. Retained spans
-    /// share the layout's font metric policy and do not introduce text or shaping boundaries.
+    /// share the layout's font metric policy and introduce no text. Non-baseline alignment
+    /// interrupts adjacent-text shaping; baseline spans preserve compatible shaping.
     pub fn set_empty_span_participation(&mut self, enabled: bool) {
         self.retain_empty_spans = enabled;
     }
@@ -363,7 +366,16 @@ impl<'b, B: Brush> TreeBuilder<'b, B> {
         self.lcx.tree_style_builder.take_sources();
 
         // Call generic layout builder method
-        build_into_layout(layout, &text, self.lcx, self.fcx, self.options);
+        let shaping_boundaries =
+            empty_span_shaping_boundaries(&empty_spans, &self.lcx.style_table, text.len());
+        build_into_layout(
+            layout,
+            &text,
+            self.lcx,
+            self.fcx,
+            self.options,
+            &shaping_boundaries,
+        );
         layout.data.empty_spans = empty_spans;
 
         text
@@ -379,7 +391,16 @@ impl<'b, B: Brush> TreeBuilder<'b, B> {
             self.retain_empty_spans,
         );
         let sources = self.lcx.tree_style_builder.take_sources();
-        build_into_layout(layout, &text, self.lcx, self.fcx, self.options);
+        let shaping_boundaries =
+            empty_span_shaping_boundaries(&empty_spans, &self.lcx.style_table, text.len());
+        build_into_layout(
+            layout,
+            &text,
+            self.lcx,
+            self.fcx,
+            self.options,
+            &shaping_boundaries,
+        );
         layout.data.empty_spans = empty_spans;
         (text, sources)
     }
@@ -392,12 +413,35 @@ impl<'b, B: Brush> TreeBuilder<'b, B> {
     }
 }
 
+// Empty candidates are already in normalized text order. These itemization-only boundaries
+// neither add layout items nor alter Unicode analysis, provenance or legal line breaks.
+fn empty_span_shaping_boundaries<B: Brush>(
+    empty_spans: &[EmptySpan],
+    styles: &[ResolvedStyle<B>],
+    text_len: usize,
+) -> Vec<ShapingBoundary> {
+    let mut boundaries: Vec<_> = empty_spans
+        .iter()
+        .filter(|span| {
+            span.index > 0
+                && span.index < text_len
+                && styles[usize::from(span.style)].vertical_align != crate::VerticalAlign::BASELINE
+        })
+        .map(|span| ShapingBoundary {
+            byte_index: span.index,
+        })
+        .collect();
+    boundaries.dedup_by_key(|boundary| boundary.byte_index);
+    boundaries
+}
+
 fn build_into_layout<B: Brush>(
     layout: &mut Layout<B>,
     text: &str,
     lcx: &mut LayoutContext<B>,
     fcx: &mut FontContext,
     options: BuilderOptions<'_>,
+    shaping_boundaries: &[ShapingBoundary],
 ) {
     assert!(
         options.quantization_mode != QuantizationMode::Logical
@@ -462,6 +506,7 @@ fn build_into_layout<B: Brush>(
             fcx,
             &lcx.style_table,
             &lcx.inline_boxes,
+            shaping_boundaries,
             &lcx.analysis,
             &lcx.char_style_indices,
             &mut lcx.scx,

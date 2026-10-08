@@ -43,11 +43,18 @@ const OPTIONAL_LIGATURES_OFF: [FontFeature; 4] = [
     FontFeature::new(Tag::new(b"hlig"), 0),
 ];
 
+/// A normalized byte position that interrupts shaping without introducing a text/layout item.
+#[derive(Clone, Copy)]
+pub(crate) struct ShapingBoundary {
+    pub(crate) byte_index: usize,
+}
+
 pub(crate) fn shape_text<'a, B: Brush>(
     rcx: &'a ResolveContext,
     fcx: &'a mut FontContext,
     styles: &'a [ResolvedStyle<B>],
     inline_boxes: &[LayoutInlineBox],
+    shaping_boundaries: &[ShapingBoundary],
     analysis: &Analysis,
     char_style_indices: &[u16],
     scx: &mut Shaper,
@@ -74,6 +81,7 @@ pub(crate) fn shape_text<'a, B: Brush>(
     let mut fq = fcx.collection.query(&mut fcx.source_cache);
 
     let mut inline_box_iter = inline_boxes.iter().map(|b| &b.inline_box).peekable();
+    let mut boundary_iter = shaping_boundaries.iter().peekable();
 
     // Merge font features with letter-spacing ligature suppression.
     //
@@ -98,7 +106,7 @@ pub(crate) fn shape_text<'a, B: Brush>(
         })
         .collect();
 
-    // Split when shaping-relevant style properties change and at inline boxes.
+    // Split when shaping-relevant style properties change, at inline boxes and explicit boundaries.
     let items = {
         // TODO: we currently walk characters here, but we could instead just walk boundaries of
         // styles and inline boxes.
@@ -138,6 +146,19 @@ pub(crate) fn shape_text<'a, B: Brush>(
                         inline_box_iter.next();
                     } else if inline_box.index == byte_index {
                         inline_box_iter.next();
+                        split = true;
+                    } else {
+                        break;
+                    }
+                }
+
+                // Itemization-only boundaries can coincide with each other or atomic boxes.
+                // Like boxes, discard entries already passed by an independent bidi split.
+                while let Some(boundary) = boundary_iter.peek() {
+                    if boundary.byte_index < byte_index {
+                        boundary_iter.next();
+                    } else if boundary.byte_index == byte_index {
+                        boundary_iter.next();
                         split = true;
                     } else {
                         break;

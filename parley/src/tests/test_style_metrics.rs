@@ -1831,3 +1831,281 @@ fn empty_span_after_atomic_quota_stays_on_the_atomic_line() {
         );
     }
 }
+
+fn glyph_shape_signature(layout: &Layout<ColorBrush>) -> alloc::vec::Vec<(u32, f32)> {
+    layout
+        .lines()
+        .flat_map(|line| line.items())
+        .filter_map(|item| match item {
+            crate::PositionedLayoutItem::GlyphRun(run) => Some(run),
+            _ => None,
+        })
+        .flat_map(|run| {
+            run.glyphs()
+                .map(|glyph| (glyph.id, glyph.advance))
+                .collect::<alloc::vec::Vec<_>>()
+        })
+        .collect()
+}
+
+fn direct_inline_boundary_layout(
+    fcx: &mut crate::FontContext,
+    lcx: &mut LayoutContext<ColorBrush>,
+    tail: &str,
+) -> Layout<ColorBrush> {
+    let root = root_style();
+    let mut builder = lcx.tree_builder(fcx, 1., false, &root);
+    builder.push_text("f");
+    builder.push_inline_box(InlineBox {
+        id: 303,
+        kind: InlineBoxKind::InFlow,
+        index: 0,
+        width: 0.,
+        height: 0.,
+        baseline: Some(0.),
+        vertical_align: VerticalAlign::BASELINE,
+    });
+    builder.push_text(tail);
+    let (mut layout, _) = builder.build();
+    layout.break_all_lines(None);
+    layout
+}
+
+fn empty_shifted_boundary_layout(
+    fcx: &mut crate::FontContext,
+    lcx: &mut LayoutContext<ColorBrush>,
+    align: VerticalAlign,
+    tail: &str,
+) -> Layout<ColorBrush> {
+    let root = root_style();
+    let mut builder = lcx.tree_builder(fcx, 1., false, &root);
+    builder.set_empty_span_participation(true);
+    builder.push_text("f");
+    builder.push_style_span(TextStyle {
+        vertical_align: align,
+        ..root_style()
+    });
+    builder.pop_style_span();
+    builder.push_text(tail);
+    let (mut layout, _) = builder.build();
+    layout.break_all_lines(None);
+    layout
+}
+
+fn disabled_empty_boundary_layout(
+    fcx: &mut crate::FontContext,
+    lcx: &mut LayoutContext<ColorBrush>,
+) -> Layout<ColorBrush> {
+    let root = root_style();
+    let mut builder = lcx.tree_builder(fcx, 1., false, &root);
+    builder.set_empty_span_participation(false);
+    builder.push_text("f");
+    builder.push_style_span(TextStyle {
+        vertical_align: VerticalAlign::length(3.),
+        ..root_style()
+    });
+    builder.pop_style_span();
+    builder.push_text("i");
+    let (mut layout, _) = builder.build();
+    layout.break_all_lines(None);
+    layout
+}
+
+#[test]
+fn baseline_empty_span_follows_the_complete_crossing_ligature() {
+    let mut fcx = create_font_context();
+    let mut lcx = LayoutContext::new();
+    let root = root_style();
+    let mut builder = lcx.tree_builder(&mut fcx, 1., false, &root);
+    builder.set_empty_span_participation(true);
+    builder.push_text("f");
+    builder.push_style_span(TextStyle {
+        vertical_align: VerticalAlign::BASELINE,
+        ..root_style()
+    });
+    builder.pop_style_span();
+    builder.push_text("i");
+    let (mut layout, _) = builder.build();
+    layout.break_all_lines(None);
+
+    assert_eq!(
+        glyph_shape_signature(&layout).len(),
+        1,
+        "a baseline empty span must not split the crossing fi ligature"
+    );
+    let line = layout.lines().next().unwrap();
+    let (_, offset) = line.empty_spans().next().unwrap();
+    let text_end = line
+        .items()
+        .filter_map(|item| match item {
+            crate::PositionedLayoutItem::GlyphRun(run) => Some(run.offset() + run.advance()),
+            _ => None,
+        })
+        .last()
+        .unwrap();
+    assert_close(offset, text_end);
+}
+
+#[test]
+fn shifted_empty_spans_form_one_real_fi_shaping_boundary() {
+    let mut fcx = create_font_context();
+    let mut lcx = LayoutContext::new();
+    let direct_inline = direct_inline_boundary_layout(&mut fcx, &mut lcx, "i");
+    let expected = glyph_shape_signature(&direct_inline);
+    assert_eq!(
+        expected.len(),
+        2,
+        "the bundled fixture must expose a split f/i reference"
+    );
+    for align in [VerticalAlign::length(3.), VerticalAlign::SUPER] {
+        let shifted = empty_shifted_boundary_layout(&mut fcx, &mut lcx, align, "i");
+        assert_eq!(glyph_shape_signature(&shifted), expected);
+        assert_eq!(
+            shifted.data.shaped_text.runs().len(),
+            direct_inline.data.shaped_text.runs().len()
+        );
+        assert_eq!(shifted.lines().next().unwrap().empty_spans().count(), 1);
+    }
+}
+
+#[test]
+fn coincident_nested_shifted_empty_spans_deduplicate_the_shaping_boundary() {
+    let mut fcx = create_font_context();
+    let mut lcx = LayoutContext::new();
+    let direct = direct_inline_boundary_layout(&mut fcx, &mut lcx, "i");
+
+    let root = root_style();
+    let mut builder = lcx.tree_builder(&mut fcx, 1., false, &root);
+    builder.set_empty_span_participation(true);
+    builder.push_text("f");
+    builder.push_style_span(TextStyle {
+        vertical_align: VerticalAlign::length(3.),
+        ..root_style()
+    });
+    builder.push_style_span(TextStyle {
+        vertical_align: VerticalAlign::SUPER,
+        ..root_style()
+    });
+    builder.pop_style_span();
+    builder.pop_style_span();
+    builder.push_text("i");
+    let (mut nested, _) = builder.build();
+    nested.break_all_lines(None);
+
+    assert_eq!(
+        glyph_shape_signature(&nested),
+        glyph_shape_signature(&direct)
+    );
+    assert_eq!(
+        nested.data.shaped_text.runs().len(),
+        direct.data.shaped_text.runs().len()
+    );
+    assert_eq!(nested.lines().next().unwrap().empty_spans().count(), 2);
+}
+
+#[test]
+fn a_ligature_wholly_after_a_shifted_empty_boundary_is_preserved() {
+    let mut fcx = create_font_context();
+    let mut lcx = LayoutContext::new();
+
+    let root = root_style();
+    let mut joined_builder = lcx.tree_builder(&mut fcx, 1., false, &root);
+    joined_builder.push_text("fi");
+    let (mut joined, _) = joined_builder.build();
+    joined.break_all_lines(None);
+    let joined_signature = glyph_shape_signature(&joined);
+    assert_eq!(
+        joined_signature.len(),
+        1,
+        "the bundled fixture must expose the fi ligature"
+    );
+
+    let split = direct_inline_boundary_layout(&mut fcx, &mut lcx, "i");
+    assert_ne!(glyph_shape_signature(&split), joined_signature);
+    let expected = direct_inline_boundary_layout(&mut fcx, &mut lcx, "fi");
+    let shifted =
+        empty_shifted_boundary_layout(&mut fcx, &mut lcx, VerticalAlign::length(3.), "fi");
+    let shifted_signature = glyph_shape_signature(&shifted);
+    assert_eq!(shifted_signature, glyph_shape_signature(&expected));
+    assert_eq!(&shifted_signature[1..], joined_signature.as_slice());
+}
+
+#[test]
+fn pending_space_boundary_keeps_normalized_sources_and_disabled_reuse_has_no_seam() {
+    let mut fcx = create_font_context();
+    let mut lcx = LayoutContext::new();
+    let build_pending =
+        |enabled: bool, fcx: &mut crate::FontContext, lcx: &mut LayoutContext<ColorBrush>| {
+            let root = TextStyle {
+                white_space_collapse: WhiteSpaceCollapse::Collapse,
+                ..root_style()
+            };
+            let mut builder = lcx.tree_builder(fcx, 1., false, &root);
+            builder.set_empty_span_participation(enabled);
+            builder.push_text_with_source("f ", 401);
+            builder.push_style_span(TextStyle {
+                vertical_align: VerticalAlign::length(3.),
+                white_space_collapse: WhiteSpaceCollapse::Collapse,
+                ..root_style()
+            });
+            builder.pop_style_span();
+            builder.push_text_with_source(" i", 402);
+            let mut layout = Layout::default();
+            let (text, sources) = builder.build_into_with_sources(&mut layout);
+            layout.break_all_lines(None);
+            (layout, text, sources)
+        };
+
+    let (disabled, text, sources) = build_pending(false, &mut fcx, &mut lcx);
+    let (enabled, enabled_text, enabled_sources) = build_pending(true, &mut fcx, &mut lcx);
+    assert_eq!(enabled_text, text);
+    assert_eq!(enabled_sources, sources);
+    assert_eq!(text, "f i");
+    assert_eq!(
+        sources,
+        alloc::vec![
+            crate::TextSourceRange {
+                range: 0..2,
+                source: 401
+            },
+            crate::TextSourceRange {
+                range: 2..3,
+                source: 402
+            },
+        ]
+    );
+    let line = enabled.lines().next().unwrap();
+    let (_, offset) = line.empty_spans().next().unwrap();
+    assert_close(
+        offset,
+        crate::Cluster::from_byte_index(&enabled, 2)
+            .unwrap()
+            .visual_offset()
+            .unwrap(),
+    );
+    assert!(
+        disabled
+            .lines()
+            .next()
+            .unwrap()
+            .empty_spans()
+            .next()
+            .is_none()
+    );
+
+    let enabled = empty_shifted_boundary_layout(&mut fcx, &mut lcx, VerticalAlign::length(3.), "i");
+    let disabled = disabled_empty_boundary_layout(&mut fcx, &mut lcx);
+    let root = root_style();
+    let mut joined_builder = lcx.tree_builder(&mut fcx, 1., false, &root);
+    joined_builder.push_text("fi");
+    let (mut joined, _) = joined_builder.build();
+    joined.break_all_lines(None);
+    assert_ne!(
+        glyph_shape_signature(&enabled),
+        glyph_shape_signature(&joined)
+    );
+    assert_eq!(
+        glyph_shape_signature(&disabled),
+        glyph_shape_signature(&joined)
+    );
+}

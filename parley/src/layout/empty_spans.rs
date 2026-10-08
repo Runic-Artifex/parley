@@ -19,7 +19,15 @@ pub(super) fn positions<'a, B: Brush>(
                 .index
                 .checked_sub(1)
                 .and_then(|byte| crate::Cluster::from_byte_index(line.layout, byte))
-                .filter(|cluster| cluster.path().line_index() == line.index as usize);
+                .filter(|cluster| cluster.path().line_index() == line.index as usize)
+                .map(|cluster| {
+                    // A cross-element ligature belongs to its first text item. An empty
+                    // element within that atom follows its full advance, not a caret component.
+                    cluster
+                        .run()
+                        .cluster_containing_char(cluster.atom.char_range().end - 1)
+                        .unwrap_or(cluster)
+                });
             let downstream = crate::Cluster::from_byte_index(line.layout, span.index)
                 .filter(|cluster| cluster.path().line_index() == line.index as usize);
             let mut offset = if let Some(cluster) = upstream {

@@ -200,6 +200,8 @@ pub(crate) struct LayoutData<B: Brush> {
     pub(crate) scale: f32,
     /// Whether metrics should be quantized to pixel boundaries
     pub(crate) quantize: bool,
+    /// Whether every line begins with the root span box (the CSS "strut").
+    pub(crate) include_root_strut: bool,
     /// The `BiDi` base level
     pub(crate) base_level: BidiLevel,
     /// The length of the text in the layout
@@ -248,6 +250,7 @@ impl<B: Brush> Default for LayoutData<B> {
         Self {
             scale: 1.,
             quantize: true,
+            include_root_strut: true,
             base_level: BidiLevel::new(0),
             text_len: 0,
             width: 0.,
@@ -274,6 +277,7 @@ impl<B: Brush> LayoutData<B> {
     pub(crate) fn clear(&mut self) {
         self.scale = 1.;
         self.quantize = true;
+        self.include_root_strut = true;
         self.base_level = BidiLevel::new(0);
         self.text_len = 0;
         self.width = 0.;

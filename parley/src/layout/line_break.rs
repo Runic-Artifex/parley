@@ -766,16 +766,18 @@ impl<'a, B: Brush> BreakLines<'a, B> {
 
     /// Reset the per-line running state in preparation for building a new line.
     ///
-    /// The line starts out containing the root span box (the "strut", CSS 2 §10.8).
+    /// When enabled, the line starts out containing the root span box (the "strut", CSS 2 §10.8).
     fn reset_line(&mut self) {
         let state = &mut self.state;
         state.line.reset();
         state.contributed.clear();
-        state.line.box_metrics.add_style(
-            0,
-            &self.layout.data.style_metrics,
-            &mut state.contributed,
-        );
+        if self.layout.data.include_root_strut {
+            state.line.box_metrics.add_style(
+                0,
+                &self.layout.data.style_metrics,
+                &mut state.contributed,
+            );
+        }
         state.update_max_height_exceeded();
     }
 

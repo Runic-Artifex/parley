@@ -320,6 +320,101 @@ fn line_with_only_empty_inline_boxes_is_invisible() {
     assert_eq!(line_height(10., InlineBoxKind::InFlow), 30.);
 }
 
+#[test]
+fn root_strut_can_be_disabled_without_suppressing_text_styles() {
+    let mut fcx = create_font_context();
+    let mut lcx: LayoutContext<ColorBrush> = LayoutContext::new();
+    let root = root_style();
+
+    let mut builder = lcx.tree_builder(&mut fcx, 1., false, &root);
+    builder.push_inline_box(InlineBox {
+        id: 0,
+        kind: InlineBoxKind::InFlow,
+        index: 0,
+        width: 0.,
+        height: 10.,
+        baseline: None,
+        vertical_align: VerticalAlign::BASELINE,
+    });
+    let (mut default_layout, _) = builder.build();
+    default_layout.break_all_lines(None);
+    assert_eq!(
+        default_layout.lines().next().unwrap().metrics().line_height,
+        30.
+    );
+
+    let mut builder = lcx.tree_builder(&mut fcx, 1., false, &root);
+    builder.push_inline_box(InlineBox {
+        id: 0,
+        kind: InlineBoxKind::InFlow,
+        index: 0,
+        width: 0.,
+        height: 10.,
+        baseline: None,
+        vertical_align: VerticalAlign::BASELINE,
+    });
+    let (mut atomic_only_layout, _) = builder.build();
+    atomic_only_layout.set_include_root_strut(false);
+    atomic_only_layout.break_all_lines(None);
+    assert_eq!(
+        atomic_only_layout
+            .lines()
+            .next()
+            .unwrap()
+            .metrics()
+            .line_height,
+        10.
+    );
+
+    let mut builder = lcx.tree_builder(&mut fcx, 1., false, &root);
+    builder.push_text("text");
+    let (mut text_layout, _) = builder.build();
+    text_layout.set_include_root_strut(false);
+    text_layout.break_all_lines(None);
+    // Text atoms contribute their own span boxes and all ancestors, including the root.
+    assert_eq!(
+        text_layout.lines().next().unwrap().metrics().line_height,
+        30.
+    );
+}
+
+#[test]
+fn rebuilding_a_layout_restores_the_root_strut_default() {
+    let mut fcx = create_font_context();
+    let mut lcx: LayoutContext<ColorBrush> = LayoutContext::new();
+    let root = root_style();
+    let mut layout = Layout::new();
+
+    let mut builder = lcx.tree_builder(&mut fcx, 1., false, &root);
+    builder.push_inline_box(InlineBox {
+        id: 0,
+        kind: InlineBoxKind::InFlow,
+        index: 0,
+        width: 0.,
+        height: 10.,
+        baseline: None,
+        vertical_align: VerticalAlign::BASELINE,
+    });
+    builder.build_into(&mut layout);
+    layout.set_include_root_strut(false);
+    layout.break_all_lines(None);
+    assert_eq!(layout.lines().next().unwrap().metrics().line_height, 10.);
+
+    let mut builder = lcx.tree_builder(&mut fcx, 1., false, &root);
+    builder.push_inline_box(InlineBox {
+        id: 0,
+        kind: InlineBoxKind::InFlow,
+        index: 0,
+        width: 0.,
+        height: 10.,
+        baseline: None,
+        vertical_align: VerticalAlign::BASELINE,
+    });
+    builder.build_into(&mut layout);
+    layout.break_all_lines(None);
+    assert_eq!(layout.lines().next().unwrap().metrics().line_height, 30.);
+}
+
 /// With quantization, an inline box's fractional height must not be rounded up twice (once for
 /// the ascent and once for the descent): the line reserves exactly the box's height.
 #[test]

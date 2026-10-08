@@ -56,6 +56,19 @@ impl<B: Brush> Layout<B> {
         self.data.clear();
     }
 
+    /// Sets whether line breaking includes the root span box on every line.
+    ///
+    /// Set this after building and before breaking lines. Disabling it removes
+    /// only the unconditional root contribution; text still contributes its
+    /// span boxes and their ancestors, and inline boxes retain their extents.
+    /// Existing broken lines are not updated until line breaking runs again.
+    ///
+    /// This is enabled by default. Calling [`Layout::clear`] or rebuilding into
+    /// this layout restores the default.
+    pub fn set_include_root_strut(&mut self, include: bool) {
+        self.data.include_root_strut = include;
+    }
+
     /// Returns the scale factor provided when creating the layout.
     pub fn scale(&self) -> f32 {
         self.data.scale

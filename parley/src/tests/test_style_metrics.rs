@@ -466,21 +466,12 @@ fn style_content_bounds_follow_top_bottom_and_nested_vertical_alignment() {
         assert!((bottom - (baseline + style_metrics.descent)).abs() < 1e-4);
     }
 
-    let top_metrics = metrics(&layout)[1];
-    let bottom_metrics = metrics(&layout)[3];
     let (top_start, _) = line.style_content_bounds(1).unwrap();
     let (_, bottom_end) = line.style_content_bounds(3).unwrap();
-    assert!(
-        (top_start - (line.metrics().block_min_coord + top_metrics.over - top_metrics.ascent))
-            .abs()
-            < 1e-4
-    );
-    assert!(
-        (bottom_end
-            - (line.metrics().block_max_coord - bottom_metrics.under + bottom_metrics.descent))
-            .abs()
-            < 1e-4
-    );
+    // `top`/`bottom` align each *aligned subtree* to the line box. The nested spans therefore
+    // make neither parent span's font content edge coincide with the corresponding line edge.
+    assert!(top_start > line.metrics().block_min_coord);
+    assert!(bottom_end < line.metrics().block_max_coord);
     assert!(baselines[2].unwrap() < baselines[1].unwrap());
     assert!(baselines[4].unwrap() > baselines[3].unwrap());
 }

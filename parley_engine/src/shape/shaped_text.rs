@@ -99,6 +99,70 @@ impl FontMetrics {
         )))
     }
 
+    /// Measure a lowercase x contour using normal automatic hinting at `font_size`.
+    ///
+    /// This is an optional fallback for consumers whose metric policy uses hinted contour
+    /// heights when a font does not declare an x-height. It does not replace declared OS/2
+    /// or MVAR metrics or change shaping. Callers choose the measurement coordinate space;
+    /// the returned height is in the same units as `font_size`.
+    ///
+    /// Synthesis axis settings are applied before authored `variations`, as in
+    /// [`Self::from_font_instance`]. Invalid fonts, missing x mappings or outlines, and
+    /// nonpositive/nonfinite contour heights return `None`.
+    pub fn synthesize_x_height(
+        font: &FontInstance,
+        font_size: f32,
+        variations: &[parlance::FontVariation],
+    ) -> Option<f32> {
+        use skrifa::outline::{
+            DrawSettings, Engine, GlyphStyles, HintingInstance, HintingOptions, SmoothMode, Target,
+            pen::ControlBoundsPen,
+        };
+        if !font_size.is_finite() || font_size <= 0. {
+            return None;
+        }
+        let font_ref =
+            skrifa::FontRef::from_index(font.font.data.as_ref(), font.font.index).ok()?;
+        let location = font_ref.axes().location(
+            font.synthesis
+                .variation_settings()
+                .iter()
+                .map(|(tag, value)| (skrifa::Tag::new(&tag.to_be_bytes()), *value))
+                .chain(
+                    variations
+                        .iter()
+                        .map(|v| (skrifa::Tag::new(&v.tag.to_bytes()), v.value)),
+                ),
+        );
+        let glyph_id = font_ref.charmap().map('x')?;
+        if glyph_id.to_u32() == 0 {
+            return None;
+        }
+        let outlines = font_ref.outline_glyphs();
+        let glyph = outlines.get(glyph_id)?;
+        let hinting = HintingInstance::new(
+            &outlines,
+            skrifa::prelude::Size::new(font_size),
+            &location,
+            HintingOptions {
+                engine: Engine::Auto(Some(GlyphStyles::new(&outlines))),
+                target: Target::Smooth {
+                    mode: SmoothMode::Normal,
+                    symmetric_rendering: true,
+                    preserve_linear_metrics: false,
+                },
+            },
+        )
+        .ok()?;
+        let mut pen = ControlBoundsPen::default();
+        glyph
+            .draw(DrawSettings::hinted(&hinting, false), &mut pen)
+            .ok()?;
+        let bounds = pen.bounding_box()?;
+        let height = bounds.y_max - bounds.y_min;
+        (height.is_finite() && height > 0.).then_some(height)
+    }
+
     fn from_skrifa_metrics(metrics: &skrifa::metrics::Metrics) -> Self {
         let units_per_em = metrics.units_per_em as f32;
 
@@ -566,7 +630,7 @@ mod tests {
         shape::CharCluster,
     };
 
-    use super::ShapedText;
+    use super::{FontMetrics, ShapedText};
 
     const ROBOTO: &[u8] =
         include_bytes!("../../../parley_dev/assets/fonts/roboto_fonts/Roboto-Regular.ttf");
@@ -632,6 +696,187 @@ mod tests {
             font: FontData::new(Blob::new(Arc::new(font_data)), 0),
             synthesis: Synthesis::default(),
         }
+    }
+
+    fn owned_font_instance(font_data: Vec<u8>) -> FontInstance {
+        FontInstance {
+            font: FontData::new(Blob::new(Arc::new(font_data)), 0),
+            synthesis: Synthesis::default(),
+        }
+    }
+
+    fn read_u16(data: &[u8], offset: usize) -> Option<u16> {
+        Some(u16::from_be_bytes(
+            data.get(offset..offset.checked_add(2)?)?.try_into().ok()?,
+        ))
+    }
+
+    fn read_u32(data: &[u8], offset: usize) -> Option<u32> {
+        Some(u32::from_be_bytes(
+            data.get(offset..offset.checked_add(4)?)?.try_into().ok()?,
+        ))
+    }
+
+    fn write_u16(data: &mut [u8], offset: usize, value: u16) -> Option<()> {
+        data.get_mut(offset..offset.checked_add(2)?)?
+            .copy_from_slice(&value.to_be_bytes());
+        Some(())
+    }
+
+    /// Finds an SFNT table directory record and returns its record and data offsets.
+    ///
+    /// The test mutations below deliberately use an existing real font: changing a directory
+    /// entry lets us exercise malformed/missing metadata without introducing a second fixture.
+    fn table_offsets(data: &[u8], tag: &[u8; 4]) -> Option<(usize, usize)> {
+        let tables = usize::from(read_u16(data, 4)?);
+        for index in 0..tables {
+            let record = 12usize.checked_add(index.checked_mul(16)?)?;
+            if data.get(record..record.checked_add(4)?) == Some(tag) {
+                return Some((record, usize::try_from(read_u32(data, record + 8)?).ok()?));
+            }
+        }
+        None
+    }
+
+    fn roboto_without_os2_x_height() -> Vec<u8> {
+        let mut data = ROBOTO.to_vec();
+        let (_, os2) = table_offsets(&data, b"OS/2").expect("Roboto has OS/2");
+        write_u16(&mut data, os2, 1).expect("OS/2 version fits");
+        data
+    }
+
+    fn roboto_without_cmap() -> Vec<u8> {
+        let mut data = ROBOTO.to_vec();
+        let (record, _) = table_offsets(&data, b"cmap").expect("Roboto has cmap");
+        data[record..record + 4].copy_from_slice(b"gone");
+        data
+    }
+
+    fn roboto_x_mapped_to(glyph_id: u16) -> Vec<u8> {
+        let mut data = ROBOTO.to_vec();
+        let (_, cmap) = table_offsets(&data, b"cmap").expect("Roboto has cmap");
+        let encoding_records = usize::from(read_u16(&data, cmap + 2).expect("cmap header"));
+        let mut format4 = None;
+        for index in 0..encoding_records {
+            let record = cmap + 4 + index * 8;
+            let subtable = cmap
+                + usize::try_from(read_u32(&data, record + 4).expect("encoding record"))
+                    .expect("subtable offset fits");
+            if read_u16(&data, subtable) == Some(4) {
+                format4 = Some(subtable);
+                break;
+            }
+        }
+        let format4 = format4.expect("Roboto has format 4 cmap");
+        let segments = usize::from(read_u16(&data, format4 + 6).expect("segment count")) / 2;
+        let end_codes = format4 + 14;
+        let start_codes = end_codes + segments * 2 + 2;
+        let deltas = start_codes + segments * 2;
+        let range_offsets = deltas + segments * 2;
+        let x = u16::from(b'x');
+        let segment = (0..segments)
+            .find(|&index| {
+                let start = read_u16(&data, start_codes + index * 2).expect("start code");
+                let end = read_u16(&data, end_codes + index * 2).expect("end code");
+                start <= x && x <= end
+            })
+            .expect("Roboto cmap covers x");
+        assert_eq!(
+            read_u16(&data, range_offsets + segment * 2),
+            Some(0),
+            "test assumes a direct cmap segment"
+        );
+        write_u16(&mut data, deltas + segment * 2, glyph_id.wrapping_sub(x)).expect("delta fits");
+        data
+    }
+
+    #[test]
+    fn synthesized_x_height_uses_a_real_x_when_os2_omits_it() {
+        let font = owned_font_instance(roboto_without_os2_x_height());
+        let metrics = FontMetrics::from_font_instance(&font, 16., &[]).unwrap();
+        assert_eq!(metrics.x_height, None, "OS/2 v1 has no sxHeight");
+
+        let x_height = FontMetrics::synthesize_x_height(&font, 16., &[])
+            .expect("the real Roboto x has a positive hinted contour height");
+        assert!(x_height.is_finite() && x_height > 0.);
+    }
+
+    #[test]
+    fn synthesized_x_height_leaves_declared_metrics_unchanged() {
+        let font = font_instance(ROBOTO);
+        let before = FontMetrics::from_font_instance(&font, 16., &[]).unwrap();
+        assert!(before.x_height.is_some(), "Roboto declares OS/2.sxHeight");
+
+        assert!(FontMetrics::synthesize_x_height(&font, 16., &[]).is_some());
+        assert_eq!(
+            FontMetrics::from_font_instance(&font, 16., &[]),
+            Some(before)
+        );
+    }
+
+    #[test]
+    fn synthesized_x_height_rejects_missing_and_notdef_x_mappings() {
+        let missing = owned_font_instance(roboto_without_cmap());
+        assert_eq!(FontMetrics::synthesize_x_height(&missing, 16., &[]), None);
+
+        let notdef = owned_font_instance(roboto_x_mapped_to(0));
+        assert_eq!(FontMetrics::synthesize_x_height(&notdef, 16., &[]), None);
+    }
+
+    #[test]
+    fn synthesized_x_height_rejects_empty_outline_and_invalid_font() {
+        use skrifa::MetadataProvider as _;
+
+        let original = font_instance(ROBOTO);
+        let font_ref =
+            skrifa::FontRef::from_index(original.font.data.as_ref(), original.font.index).unwrap();
+        let space = font_ref.charmap().map(' ').unwrap();
+        let bounds = font_ref
+            .glyph_metrics(
+                skrifa::prelude::Size::new(16.),
+                skrifa::instance::LocationRef::default(),
+            )
+            .bounds(space)
+            .unwrap();
+        assert_eq!(
+            bounds.y_max - bounds.y_min,
+            0.,
+            "Roboto's space has no contour height"
+        );
+
+        let empty = owned_font_instance(roboto_x_mapped_to(space.to_u32() as u16));
+        assert_eq!(FontMetrics::synthesize_x_height(&empty, 16., &[]), None);
+
+        let invalid = owned_font_instance(vec![0, 1, 2]);
+        assert_eq!(FontMetrics::synthesize_x_height(&invalid, 16., &[]), None);
+    }
+
+    #[test]
+    fn synthesized_x_height_rejects_invalid_sizes() {
+        let font = font_instance(ROBOTO);
+        for size in [0., -1., f32::NAN, f32::INFINITY] {
+            assert_eq!(FontMetrics::synthesize_x_height(&font, size, &[]), None);
+        }
+    }
+
+    #[test]
+    fn synthesized_x_height_follows_variable_lowercase_height() {
+        let font = font_instance(include_bytes!(
+            "../../../parley_dev/assets/fonts/roboto_fonts/RobotoFlex-VariableFont.ttf"
+        ));
+        let at_height = |value| {
+            FontMetrics::synthesize_x_height(
+                &font,
+                64.,
+                &[parlance::FontVariation::new(
+                    parlance::Tag::new(b"YTLC"),
+                    value,
+                )],
+            )
+            .unwrap()
+        };
+        // This axis changes lowercase contour height, independently of the declared metric.
+        assert!(at_height(570.) > at_height(416.));
     }
 
     fn shape_with_font(text: &str, font_data: &'static [u8]) -> ShapedText {

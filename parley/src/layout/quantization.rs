@@ -45,6 +45,17 @@ impl Quantization {
         }
     }
 
+    /// Logical font size for the opt-in hinted x-height fallback. Device and
+    /// unquantized layouts retain their existing missing-metric behavior.
+    pub(crate) fn x_height_measurement_size(self, font_size: f32) -> Option<f32> {
+        (self.enabled && self.mode == QuantizationMode::Logical).then_some(font_size / self.scale)
+    }
+
+    /// Convert a measured logical font metric back to layout units.
+    pub(crate) fn scale_font_metric(self, value: f32) -> f32 {
+        value * self.scale
+    }
+
     /// Round a font metric. Logical mode performs this in CSS/logical units.
     pub(crate) fn font_round(self, value: f32) -> f32 {
         if !self.enabled {

@@ -117,6 +117,122 @@ fn metrics(layout: &Layout<ColorBrush>) -> &[StyleMetrics] {
     &layout.data.style_metrics
 }
 
+/// Exercise a genuine outline whose font has no declared x-height, without adding a binary
+/// fixture. OS/2 version 1 predates sxHeight; all other Roboto tables stay unchanged.
+fn missing_x_height_context() -> crate::FontContext {
+    use alloc::sync::Arc;
+    use fontique::{Collection, CollectionOptions, SourceCache};
+    let mut data =
+        include_bytes!("../../../parley_dev/assets/fonts/roboto_fonts/Roboto-Regular.ttf").to_vec();
+    let count = u16::from_be_bytes(data[4..6].try_into().unwrap()) as usize;
+    let entry = (0..count)
+        .map(|i| 12 + i * 16)
+        .find(|&offset| &data[offset..offset + 4] == b"OS/2")
+        .unwrap();
+    let offset = u32::from_be_bytes(data[entry + 8..entry + 12].try_into().unwrap()) as usize;
+    data[offset..offset + 2].copy_from_slice(&1_u16.to_be_bytes());
+    let mut collection = Collection::new(CollectionOptions {
+        shared: false,
+        system_fonts: false,
+    });
+    collection.register_fonts(peniko::Blob::new(Arc::new(data)), None);
+    crate::FontContext {
+        collection,
+        source_cache: SourceCache::default(),
+    }
+}
+
+fn missing_x_height_layout(
+    fcx: &mut crate::FontContext,
+    scale: f32,
+    quantize: bool,
+    mode: QuantizationMode,
+) -> Layout<ColorBrush> {
+    let mut lcx = LayoutContext::new();
+    let root = TextStyle {
+        font_size: 24.,
+        line_height: LineHeight::Absolute(20.),
+        ..root_style()
+    };
+    let mut builder = lcx.tree_builder(fcx, scale, quantize, &root);
+    builder.set_quantization_mode(mode);
+    builder.push_text("Before ");
+    builder.push_style_modification_span(&[
+        StyleProperty::FontSize(10.),
+        StyleProperty::VerticalAlign(VerticalAlign::MIDDLE),
+    ]);
+    builder.push_text("x");
+    builder.pop_style_span();
+    let (mut layout, _) = builder.build();
+    layout.break_all_lines(None);
+    layout
+}
+
+#[test]
+fn missing_x_height_logical_fallback_is_measured_before_scaling() {
+    let mut fcx = missing_x_height_context();
+    let at_1 = missing_x_height_layout(&mut fcx, 1., true, QuantizationMode::Logical);
+    let expected = metrics(&at_1);
+    assert!(expected[0].x_height > 0.);
+    assert_ne!(expected[0].x_height, expected[0].ascent * 0.56);
+    for scale in [1.25, 2.] {
+        let layout = missing_x_height_layout(&mut fcx, scale, true, QuantizationMode::Logical);
+        for (actual, expected) in metrics(&layout).iter().zip(expected) {
+            assert_eq!(actual.x_height / scale, expected.x_height);
+            assert_eq!(actual.baseline_offset / scale, expected.baseline_offset);
+        }
+    }
+    // Span metrics may synthesize the fallback, but public shaped-run metrics retain None.
+    assert!(
+        at_1.lines()
+            .flat_map(|line| line.runs())
+            .all(|run| run.font_metrics().x_height.is_none())
+    );
+}
+
+#[test]
+fn missing_x_height_device_and_unquantized_modes_keep_legacy_estimate() {
+    let mut fcx = missing_x_height_context();
+    for scale in [1., 1.25, 2.] {
+        let device = missing_x_height_layout(&mut fcx, scale, true, QuantizationMode::Device);
+        for metrics in metrics(&device) {
+            assert_eq!(metrics.x_height, (metrics.ascent * 0.56).round());
+        }
+        let unquantized = missing_x_height_layout(&mut fcx, scale, false, QuantizationMode::Device);
+        for metrics in metrics(&unquantized) {
+            assert_eq!(metrics.x_height, metrics.ascent * 0.56);
+        }
+        let logical = missing_x_height_layout(&mut fcx, scale, false, QuantizationMode::Logical);
+        let mut expected = unquantized.data.clone();
+        expected.quantization_mode = QuantizationMode::Logical;
+        assert_eq!(expected, logical.data);
+    }
+}
+
+#[test]
+fn declared_x_height_is_preserved_in_logical_metrics() {
+    let mut fcx = create_font_context();
+    let mut lcx = LayoutContext::new();
+    for scale in [1., 1.25, 2.] {
+        let mut builder = lcx.tree_builder(&mut fcx, scale, true, &root_style());
+        builder.set_quantization_mode(QuantizationMode::Logical);
+        builder.push_text("x");
+        let (mut layout, _) = builder.build();
+        layout.break_all_lines(None);
+        let declared = layout
+            .lines()
+            .next()
+            .unwrap()
+            .runs()
+            .next()
+            .unwrap()
+            .font_metrics()
+            .x_height
+            .unwrap();
+        assert_eq!(metrics(&layout)[0].x_height, declared);
+    }
+}
+
 #[test]
 fn one_metrics_entry_per_style() {
     let layout = build();

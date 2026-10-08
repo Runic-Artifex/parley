@@ -92,13 +92,39 @@ pub(crate) fn resolve_style_metrics<B: Brush>(
     out.reserve(styles.len());
 
     let mut query = fcx.collection.query(&mut fcx.source_cache);
+    // Reuse fallback measurements for spans sharing a primary font, size and variation
+    // settings. This cache is local to one resolution; no stale metrics survive a rebuild.
+    let mut x_heights: Vec<(FontInstance, f32, &[crate::FontVariation], Option<f32>)> = Vec::new();
 
     for (index, style) in styles.iter().enumerate() {
         let font_metrics = first_available_font(&mut query, rcx, style)
             .and_then(|font| {
                 let variations = rcx.variations(style.font_variations).unwrap_or(&[]);
-                shaped_run_metrics(shaped_text, &font, style.font_size, variations)
-                    .or_else(|| FontMetrics::from_font_instance(&font, style.font_size, variations))
+                let mut metrics =
+                    shaped_run_metrics(shaped_text, &font, style.font_size, variations).or_else(
+                        || FontMetrics::from_font_instance(&font, style.font_size, variations),
+                    )?;
+                if metrics.x_height.is_none() {
+                    if let Some(size) = quantization.x_height_measurement_size(style.font_size) {
+                        let height = x_heights
+                            .iter()
+                            .find(|(cached_font, cached_size, cached_variations, _)| {
+                                cached_font == &font
+                                    && cached_size.to_bits() == size.to_bits()
+                                    && *cached_variations == variations
+                            })
+                            .map(|(_, _, _, height)| *height)
+                            .unwrap_or_else(|| {
+                                let height =
+                                    FontMetrics::synthesize_x_height(&font, size, variations);
+                                x_heights.push((font.clone(), size, variations, height));
+                                height
+                            });
+                        metrics.x_height =
+                            height.map(|height| quantization.scale_font_metric(height));
+                    }
+                }
+                Some(metrics)
             })
             .unwrap_or_else(|| FontMetrics::fallback(style.font_size));
 
@@ -222,9 +248,9 @@ impl StyleMetrics {
     /// [`resolve_style_metrics`].
     fn from_font(font: &FontMetrics, line_height: f32, quantization: Quantization) -> Self {
         let box_metrics = BoxMetrics::from_font(font, line_height, quantization);
-        // Fonts without an `OS/2.sxHeight` get the same estimate Gecko and Blink use
-        // (`DEFAULT_XHEIGHT_FACTOR`); css-inline-3 §A.2 suggests measuring the `x` glyph or
-        // `0.5em` instead, but this keeps us in line with browsers.
+        // Keep the legacy estimate when no usable x-height is available. The logical
+        // policy first attempts a hinted contour fallback in resolve_style_metrics;
+        // declared OS/2/MVAR metrics, device mode and unquantized layouts are unchanged.
         let x_height = font.x_height.unwrap_or(box_metrics.ascent * 0.56);
         Self {
             ascent: box_metrics.ascent,

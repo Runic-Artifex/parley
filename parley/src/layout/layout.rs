@@ -1,10 +1,10 @@
 // Copyright 2025 the Parley Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-use crate::InlineBox;
 use crate::layout::alignment::align;
 use crate::layout::data::LayoutData;
 use crate::style::Brush;
+use crate::{InlineBox, VerticalAlign};
 use core::cmp::Ordering;
 use core::fmt;
 
@@ -77,6 +77,41 @@ impl<B: Brush> Layout<B> {
     /// Returns the style collection for the layout.
     pub fn styles(&self) -> &[Style<B>] {
         &self.data.styles
+    }
+
+    /// Updates vertical alignment without rebuilding or reshaping the text.
+    ///
+    /// Provide one entry per collected style, in layout units. `None` keeps the existing
+    /// alignment. Returns `false` without changing anything if the slice length differs from
+    /// [`Self::styles`]; valid updates, including unchanged values, return `true`.
+    ///
+    /// This reuses cached font and line-height metrics and preserves shaping boundaries,
+    /// glyphs and source positions. Call [`Self::break_all_lines`] or [`Self::break_lines`]
+    /// again before using positions; existing broken lines are not updated by this method.
+    pub fn update_vertical_alignments(&mut self, alignments: &[Option<VerticalAlign>]) -> bool {
+        if alignments.len() != self.data.styles.len()
+            || self.data.style_metrics.len() != self.data.styles.len()
+        {
+            return false;
+        }
+        let mut changed = false;
+        for (style, alignment) in self.data.styles.iter_mut().zip(alignments) {
+            if let Some(alignment) = alignment {
+                if style.vertical_align != *alignment {
+                    style.vertical_align = *alignment;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            let quantization = self.data.quantization();
+            super::style_metrics::refresh_vertical_alignments(
+                &self.data.styles,
+                quantization,
+                &mut self.data.style_metrics,
+            );
+        }
+        true
     }
 
     /// Returns the length of the source text, in bytes.

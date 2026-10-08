@@ -266,17 +266,36 @@ impl<'b, B: Brush> TreeBuilder<'b, B> {
     ///
     /// Disabled by default. Modification scopes do not generate participants. Retained spans
     /// share the layout's font metric policy and introduce no text. Non-baseline alignment
-    /// interrupts adjacent-text shaping; baseline spans preserve compatible shaping.
+    /// interrupts adjacent-text shaping; baseline spans preserve compatible shaping unless
+    /// the caller explicitly requests a shaping boundary.
     pub fn set_empty_span_participation(&mut self, enabled: bool) {
         self.retain_empty_spans = enabled;
     }
 
     pub fn push_style_span(&mut self, style: TextStyle<'_, '_, B>) {
+        self.push_style_span_with_shaping_boundaries(style, false, false);
+    }
+
+    /// Begins an ordinary span with optional forced itemization boundaries.
+    ///
+    /// `before` and `after` request a boundary at the span's normalized opening and closing
+    /// positions, respectively. Requests are independent of geometric alignment and empty-span
+    /// participation. They add no text, source range, layout item or inline advance. Existing
+    /// engine rules for shaping context and grapheme starts still apply at these boundaries.
+    /// Automatic span closing records the closing boundary as well.
+    pub fn push_style_span_with_shaping_boundaries(
+        &mut self,
+        style: TextStyle<'_, '_, B>,
+        before: bool,
+        after: bool,
+    ) {
         let resolved = self
             .lcx
             .rcx
             .resolve_entire_style_set(self.fcx, &style, self.options.scale);
-        self.lcx.tree_style_builder.push_style_span(resolved);
+        self.lcx
+            .tree_style_builder
+            .push_style_span_with_shaping_boundaries(resolved, before, after);
     }
 
     pub fn push_style_modification_span<'s, 'iter>(
@@ -366,8 +385,12 @@ impl<'b, B: Brush> TreeBuilder<'b, B> {
         self.lcx.tree_style_builder.take_sources();
 
         // Call generic layout builder method
-        let shaping_boundaries =
-            empty_span_shaping_boundaries(&empty_spans, &self.lcx.style_table, text.len());
+        let shaping_boundaries = span_shaping_boundaries(
+            &empty_spans,
+            &self.lcx.style_table,
+            text.len(),
+            self.lcx.tree_style_builder.shaping_boundaries(),
+        );
         build_into_layout(
             layout,
             &text,
@@ -391,8 +414,12 @@ impl<'b, B: Brush> TreeBuilder<'b, B> {
             self.retain_empty_spans,
         );
         let sources = self.lcx.tree_style_builder.take_sources();
-        let shaping_boundaries =
-            empty_span_shaping_boundaries(&empty_spans, &self.lcx.style_table, text.len());
+        let shaping_boundaries = span_shaping_boundaries(
+            &empty_spans,
+            &self.lcx.style_table,
+            text.len(),
+            self.lcx.tree_style_builder.shaping_boundaries(),
+        );
         build_into_layout(
             layout,
             &text,
@@ -413,24 +440,29 @@ impl<'b, B: Brush> TreeBuilder<'b, B> {
     }
 }
 
-// Empty candidates are already in normalized text order. These itemization-only boundaries
-// neither add layout items nor alter Unicode analysis, provenance or legal line breaks.
-fn empty_span_shaping_boundaries<B: Brush>(
+// These itemization-only boundaries neither add layout items nor alter text or provenance.
+// Shaped-run boundaries retain the engine's existing grapheme-start and context rules.
+fn span_shaping_boundaries<B: Brush>(
     empty_spans: &[EmptySpan],
     styles: &[ResolvedStyle<B>],
     text_len: usize,
+    mut boundaries: Vec<ShapingBoundary>,
 ) -> Vec<ShapingBoundary> {
-    let mut boundaries: Vec<_> = empty_spans
-        .iter()
-        .filter(|span| {
-            span.index > 0
-                && span.index < text_len
-                && styles[usize::from(span.style)].vertical_align != crate::VerticalAlign::BASELINE
-        })
-        .map(|span| ShapingBoundary {
-            byte_index: span.index,
-        })
-        .collect();
+    boundaries.extend(
+        empty_spans
+            .iter()
+            .filter(|span| {
+                span.index > 0
+                    && span.index < text_len
+                    && styles[usize::from(span.style)].vertical_align
+                        != crate::VerticalAlign::BASELINE
+            })
+            .map(|span| ShapingBoundary {
+                byte_index: span.index,
+            }),
+    );
+    boundaries.retain(|boundary| boundary.byte_index > 0 && boundary.byte_index < text_len);
+    boundaries.sort_unstable_by_key(|boundary| boundary.byte_index);
     boundaries.dedup_by_key(|boundary| boundary.byte_index);
     boundaries
 }

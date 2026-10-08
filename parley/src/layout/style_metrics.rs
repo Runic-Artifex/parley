@@ -34,7 +34,7 @@ use core_maths::CoreFloat;
 use fontique::{Query, QueryFamily};
 use parley_engine::{FontInstance, FontMetrics, ShapedText};
 
-use crate::layout::Quantization;
+use crate::layout::{Quantization, Style};
 use crate::resolve::{ResolveContext, ResolvedStyle};
 use crate::style::Brush;
 use crate::{AlignmentBaseline, BaselineShift, FontContext, FontData, InlineBox, VerticalAlign};
@@ -136,43 +136,77 @@ pub(crate) fn resolve_style_metrics<B: Brush>(
         let mut metrics = StyleMetrics::from_font(&font_metrics, line_height, quantization);
         metrics.font_size = style.font_size;
 
-        if index == 0 {
-            // The root span box (the strut).
-            metrics.parent = 0;
-            metrics.baseline_offset = 0.;
-            metrics.exact_baseline_offset = 0.;
-            metrics.aligned_subtree = 0;
-        } else {
-            let parent_index = usize::from(style.parent);
-            debug_assert!(
-                parent_index < index,
-                "style table must be ordered parent-first"
-            );
-            // Never let a malformed table create an orphaned span; treat it as a child of the root.
-            let parent_index = if parent_index < index {
-                parent_index
-            } else {
-                0
-            };
-            metrics.parent = parent_index as u16;
-            let parent = &out[parent_index];
-            let align = style.vertical_align;
-            if align.is_line_relative() {
-                metrics.baseline_offset = 0.;
-                metrics.exact_baseline_offset = 0.;
-                metrics.aligned_subtree = index as u16;
-            } else {
-                let shift = shift_from_parent(align, metrics.over, metrics.under, parent);
-                metrics.exact_baseline_offset = parent.exact_baseline_offset + shift;
-                // Rounded once from the accumulated offset (not per level) so the total error
-                // stays within half a pixel.
-                metrics.baseline_offset =
-                    quantization.position_round(metrics.exact_baseline_offset);
-                metrics.aligned_subtree = parent.aligned_subtree;
-            }
-        }
+        resolve_alignment(
+            index,
+            style.parent,
+            style.vertical_align,
+            out,
+            quantization,
+            &mut metrics,
+        );
 
         out.push(metrics);
+    }
+}
+
+/// Refresh only alignment-dependent metrics, reusing every cached font measurement.
+pub(crate) fn refresh_vertical_alignments<B: Brush>(
+    styles: &[Style<B>],
+    quantization: Quantization,
+    metrics: &mut [StyleMetrics],
+) {
+    for (index, style) in styles.iter().enumerate() {
+        let (parents, current) = metrics.split_at_mut(index);
+        resolve_alignment(
+            index,
+            style.parent,
+            style.vertical_align,
+            parents,
+            quantization,
+            &mut current[0],
+        );
+    }
+}
+
+fn resolve_alignment(
+    index: usize,
+    parent: u16,
+    align: VerticalAlign,
+    parents: &[StyleMetrics],
+    quantization: Quantization,
+    metrics: &mut StyleMetrics,
+) {
+    if index == 0 {
+        // The root span box (the strut).
+        metrics.parent = 0;
+        metrics.baseline_offset = 0.;
+        metrics.exact_baseline_offset = 0.;
+        metrics.aligned_subtree = 0;
+        return;
+    }
+    let parent_index = usize::from(parent);
+    debug_assert!(
+        parent_index < index,
+        "style table must be ordered parent-first"
+    );
+    // Never let a malformed table create an orphaned span; treat it as a child of the root.
+    let parent_index = if parent_index < index {
+        parent_index
+    } else {
+        0
+    };
+    metrics.parent = parent_index as u16;
+    let parent = &parents[parent_index];
+    if align.is_line_relative() {
+        metrics.baseline_offset = 0.;
+        metrics.exact_baseline_offset = 0.;
+        metrics.aligned_subtree = index as u16;
+    } else {
+        let shift = shift_from_parent(align, metrics.over, metrics.under, parent);
+        metrics.exact_baseline_offset = parent.exact_baseline_offset + shift;
+        // Round once from the accumulated offset so ancestor rounding never compounds.
+        metrics.baseline_offset = quantization.position_round(metrics.exact_baseline_offset);
+        metrics.aligned_subtree = parent.aligned_subtree;
     }
 }
 

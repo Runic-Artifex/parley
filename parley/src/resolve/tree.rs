@@ -4,6 +4,7 @@
 //! Hierarchical tree based style application.
 use alloc::{string::String, vec::Vec};
 
+use crate::shape::ShapingBoundary;
 use crate::{
     TextSourceRange,
     style::{TextWrapMode, WhiteSpaceCollapse},
@@ -21,6 +22,9 @@ struct StyleTreeNode<B: Brush> {
     /// from `style_id` only for spans that disable wrapping.
     wrappable_style_id: Option<u16>,
     anchor: usize,
+    end_anchor: usize,
+    boundary_before: bool,
+    boundary_after: bool,
     ordinary_span: bool,
     has_content: bool,
     boxes_before: usize,
@@ -45,6 +49,12 @@ struct PendingWhitespace {
     source: Option<u64>,
 }
 
+#[derive(Clone, Copy)]
+enum PendingAnchor {
+    Open(usize),
+    Close(usize),
+}
+
 /// Whether `c` is a segment break, i.e. a character which is a forced line break when preserved.
 fn is_segment_break(c: char) -> bool {
     matches!(c, '\n' | '\r' | '\u{2028}' | '\u{2029}')
@@ -60,7 +70,8 @@ pub(crate) struct TreeStyleBuilder<B: Brush> {
     uncommitted_text: String,
     uncommitted_sources: Vec<TextSourceRange>,
     sources: Vec<TextSourceRange>,
-    pending_anchors: Vec<usize>,
+    pending_anchors: Vec<PendingAnchor>,
+    boundary_spans: Vec<usize>,
     box_count: usize,
     current_span: usize,
     /// The span that a not-yet-committed collapsible whitespace sequence belongs to.
@@ -85,6 +96,7 @@ impl<B: Brush> Default for TreeStyleBuilder<B> {
             uncommitted_sources: Vec::new(),
             sources: Vec::new(),
             pending_anchors: Vec::new(),
+            boundary_spans: Vec::new(),
             box_count: 0,
             current_span: usize::MAX,
             pending_whitespace: None,
@@ -111,6 +123,7 @@ impl<B: Brush> TreeStyleBuilder<B> {
         self.uncommitted_sources.clear();
         self.sources.clear();
         self.pending_anchors.clear();
+        self.boundary_spans.clear();
         self.box_count = 0;
         self.pending_whitespace = None;
         self.last_item_is_inline_box = false;
@@ -126,6 +139,9 @@ impl<B: Brush> TreeStyleBuilder<B> {
             style_id: Some(0),
             wrappable_style_id: None,
             anchor: 0,
+            end_anchor: 0,
+            boundary_before: false,
+            boundary_after: false,
             ordinary_span: false,
             has_content: false,
             boxes_before: 0,
@@ -261,9 +277,12 @@ impl<B: Brush> TreeStyleBuilder<B> {
     }
 
     fn resolve_pending_anchors(&mut self, retained: bool) {
-        for index in self.pending_anchors.drain(..) {
-            let span = &mut self.tree[index];
-            span.anchor += usize::from(retained);
+        for anchor in self.pending_anchors.drain(..) {
+            let target = match anchor {
+                PendingAnchor::Open(index) => &mut self.tree[index].anchor,
+                PendingAnchor::Close(index) => &mut self.tree[index].end_anchor,
+            };
+            *target += usize::from(retained);
         }
     }
 
@@ -403,6 +422,15 @@ impl<B: Brush> TreeStyleBuilder<B> {
 
     /// Begins a child span with the given style, which subsequent text is attributed to.
     pub(crate) fn push_style_span(&mut self, style: ResolvedStyle<B>) {
+        self.push_style_span_with_shaping_boundaries(style, false, false);
+    }
+
+    pub(crate) fn push_style_span_with_shaping_boundaries(
+        &mut self,
+        style: ResolvedStyle<B>,
+        before: bool,
+        after: bool,
+    ) {
         self.commit_uncommitted_text();
 
         self.tree.push(StyleTreeNode {
@@ -411,13 +439,20 @@ impl<B: Brush> TreeStyleBuilder<B> {
             style_id: None,
             wrappable_style_id: None,
             anchor: self.text.len(),
+            end_anchor: self.text.len(),
+            boundary_before: before,
+            boundary_after: after,
             ordinary_span: true,
             has_content: false,
             boxes_before: self.box_count,
         });
         self.current_span = self.tree.len() - 1;
         if self.pending_whitespace.is_some() {
-            self.pending_anchors.push(self.current_span);
+            self.pending_anchors
+                .push(PendingAnchor::Open(self.current_span));
+        }
+        if before || after {
+            self.boundary_spans.push(self.current_span);
         }
     }
 
@@ -438,6 +473,12 @@ impl<B: Brush> TreeStyleBuilder<B> {
     pub(crate) fn pop_style_span(&mut self) {
         self.commit_uncommitted_text();
 
+        self.tree[self.current_span].end_anchor = self.text.len();
+        if self.tree[self.current_span].boundary_after && self.pending_whitespace.is_some() {
+            self.pending_anchors
+                .push(PendingAnchor::Close(self.current_span));
+        }
+
         self.current_span = self.tree[self.current_span]
             .parent
             .expect("Popped root style");
@@ -457,6 +498,25 @@ impl<B: Brush> TreeStyleBuilder<B> {
                 source,
             });
         }
+    }
+
+    /// Returns captured edges after finishing whitespace normalization and auto-closing spans.
+    pub(crate) fn shaping_boundaries(&self) -> Vec<ShapingBoundary> {
+        self.boundary_spans
+            .iter()
+            .flat_map(|&index| {
+                let span = &self.tree[index];
+                [
+                    span.boundary_before.then_some(ShapingBoundary {
+                        byte_index: span.anchor,
+                    }),
+                    span.boundary_after.then_some(ShapingBoundary {
+                        byte_index: span.end_anchor,
+                    }),
+                ]
+            })
+            .flatten()
+            .collect()
     }
 
     /// Computes style table + style runs and returns the final text buffer.
@@ -527,6 +587,41 @@ mod tests {
     use super::*;
     use alloc::vec::Vec;
     use core::ops::Range;
+
+    #[test]
+    fn shaping_edges_follow_only_whitespace_pending_at_capture() {
+        for (prefix, inner, suffix, expected, edges) in [
+            ("f", "i ", "z", "fi z", [1, 3]),
+            ("f", "i", " z", "fi z", [1, 2]),
+            ("f ", "", "i", "f i", [2, 2]),
+            ("f", "", " i", "f i", [1, 1]),
+            (" ", "", "i", "i", [0, 0]),
+            ("f", " ", "", "f", [1, 1]),
+            ("é ", "i ", "z", "é i z", [3, 5]),
+        ] {
+            let style = ResolvedStyle {
+                white_space_collapse: WhiteSpaceCollapse::Collapse,
+                ..ResolvedStyle::default()
+            };
+            let mut builder = TreeStyleBuilder::<u32>::default();
+            builder.begin(style.clone());
+            builder.push_text(prefix);
+            builder.push_style_span_with_shaping_boundaries(style, true, true);
+            builder.push_text(inner);
+            builder.pop_style_span();
+            builder.push_text(suffix);
+            assert_eq!(builder.finish(&mut Vec::new(), &mut Vec::new()), expected);
+            assert_eq!(
+                builder
+                    .shaping_boundaries()
+                    .iter()
+                    .map(|edge| edge.byte_index)
+                    .collect::<Vec<_>>(),
+                edges,
+                "{prefix:?} <span>{inner:?}</span> {suffix:?}",
+            );
+        }
+    }
 
     #[test]
     fn source_boundaries_do_not_change_normalization_or_style_runs() {

@@ -359,6 +359,172 @@ fn logical_quantization_scales_font_metrics_covariantly() {
 }
 
 #[test]
+fn style_content_bounds_use_own_font_metrics_not_descendant_or_atomic_extents() {
+    let mut fcx = create_font_context();
+    let mut lcx: LayoutContext<ColorBrush> = LayoutContext::new();
+    let root = root_style();
+    let mut builder = lcx.tree_builder(&mut fcx, 1., false, &root);
+    builder.push_style_span(TextStyle {
+        font_size: 40.,
+        line_height: LineHeight::Absolute(50.),
+        ..root_style()
+    });
+    builder.push_style_span(TextStyle {
+        font_size: 10.,
+        line_height: LineHeight::Absolute(20.),
+        vertical_align: VerticalAlign::SUPER,
+        ..root_style()
+    });
+    builder.push_text("child");
+    builder.pop_style_span();
+    builder.push_inline_box(InlineBox {
+        id: 1,
+        kind: InlineBoxKind::InFlow,
+        index: 0,
+        width: 20.,
+        height: 100.,
+        baseline: None,
+        vertical_align: VerticalAlign::BASELINE,
+    });
+    builder.pop_style_span();
+    let (mut layout, _) = builder.build();
+    layout.break_all_lines(None);
+
+    let line = layout.lines().next().unwrap();
+    let bounds = line.style_content_bounds(1).unwrap();
+    let parent_metrics = metrics(&layout)[1];
+    assert!((bounds.0 - (line.metrics().baseline - parent_metrics.ascent)).abs() < 1e-4);
+    assert!((bounds.1 - (line.metrics().baseline + parent_metrics.descent)).abs() < 1e-4);
+    assert!((bounds.1 - bounds.0) < line.metrics().line_height);
+
+    let atomic = line
+        .items()
+        .find_map(|item| match item {
+            crate::PositionedLayoutItem::InlineBox(inline_box) => Some(inline_box),
+            _ => None,
+        })
+        .unwrap();
+    assert!(atomic.height > bounds.1 - bounds.0);
+    assert!(atomic.y < bounds.0);
+    assert!(line.style_content_bounds(3).is_none());
+    assert!(line.style_content_bounds(usize::MAX).is_none());
+}
+
+#[test]
+fn style_content_bounds_follow_top_bottom_and_nested_vertical_alignment() {
+    let mut fcx = create_font_context();
+    let mut lcx: LayoutContext<ColorBrush> = LayoutContext::new();
+    let root = root_style();
+    let mut builder = lcx.tree_builder(&mut fcx, 1., false, &root);
+    builder.push_style_span(TextStyle {
+        font_size: 18.,
+        line_height: LineHeight::Absolute(28.),
+        vertical_align: VerticalAlign::TOP,
+        ..root_style()
+    });
+    builder.push_text("top");
+    builder.push_style_span(TextStyle {
+        font_size: 12.,
+        line_height: LineHeight::Absolute(18.),
+        vertical_align: VerticalAlign::length(3.),
+        ..root_style()
+    });
+    builder.push_text("nested-top");
+    builder.pop_style_span();
+    builder.pop_style_span();
+    builder.push_style_span(TextStyle {
+        font_size: 16.,
+        line_height: LineHeight::Absolute(24.),
+        vertical_align: VerticalAlign::BOTTOM,
+        ..root_style()
+    });
+    builder.push_text("bottom");
+    builder.push_style_span(TextStyle {
+        font_size: 11.,
+        line_height: LineHeight::Absolute(17.),
+        vertical_align: VerticalAlign::length(-2.),
+        ..root_style()
+    });
+    builder.push_text("nested-bottom");
+    builder.pop_style_span();
+    builder.pop_style_span();
+    let (mut layout, _) = builder.build();
+    layout.break_all_lines(None);
+
+    let line = layout.lines().next().unwrap();
+    let mut baselines = [None; 5];
+    for item in line.items() {
+        if let crate::PositionedLayoutItem::GlyphRun(run) = item {
+            baselines[usize::from(run.style_index())] = Some(run.baseline());
+        }
+    }
+    for style_index in 1..=4 {
+        let (top, bottom) = line.style_content_bounds(style_index).unwrap();
+        let baseline = baselines[style_index].unwrap();
+        let style_metrics = metrics(&layout)[style_index];
+        assert!((top - (baseline - style_metrics.ascent)).abs() < 1e-4);
+        assert!((bottom - (baseline + style_metrics.descent)).abs() < 1e-4);
+    }
+
+    let top_metrics = metrics(&layout)[1];
+    let bottom_metrics = metrics(&layout)[3];
+    let (top_start, _) = line.style_content_bounds(1).unwrap();
+    let (_, bottom_end) = line.style_content_bounds(3).unwrap();
+    assert!(
+        (top_start - (line.metrics().block_min_coord + top_metrics.over - top_metrics.ascent))
+            .abs()
+            < 1e-4
+    );
+    assert!(
+        (bottom_end
+            - (line.metrics().block_max_coord - bottom_metrics.under + bottom_metrics.descent))
+            .abs()
+            < 1e-4
+    );
+    assert!(baselines[2].unwrap() < baselines[1].unwrap());
+    assert!(baselines[4].unwrap() > baselines[3].unwrap());
+}
+
+#[test]
+fn style_content_bounds_scale_covariantly_with_logical_quantization() {
+    let root = TextStyle {
+        font_size: 13.,
+        line_height: LineHeight::MetricsRelative(1.),
+        ..root_style()
+    };
+    let mut fcx = create_font_context();
+    let mut lcx: LayoutContext<ColorBrush> = LayoutContext::new();
+    let mut bounds_at_scale = |scale: f32| {
+        let mut builder = lcx.tree_builder(&mut fcx, scale, true, &root);
+        builder.set_quantization_mode(QuantizationMode::Logical);
+        builder.push_style_span(TextStyle {
+            font_size: 17.,
+            line_height: LineHeight::MetricsRelative(1.),
+            vertical_align: VerticalAlign::length(0.5),
+            ..root_style()
+        });
+        builder.push_text("text");
+        builder.pop_style_span();
+        let (mut layout, _) = builder.build();
+        layout.break_all_lines(None);
+        let (top, bottom) = layout
+            .lines()
+            .next()
+            .unwrap()
+            .style_content_bounds(1)
+            .unwrap();
+        (top / scale, bottom / scale)
+    };
+
+    let at_1 = bounds_at_scale(1.);
+    for scale in [1.25, 2.] {
+        let at_scale = bounds_at_scale(scale);
+        assert!((at_scale.0 - at_1.0).abs() < 1e-4);
+        assert!((at_scale.1 - at_1.1).abs() < 1e-4);
+    }
+}
+
+#[test]
 fn logical_quantization_preserves_fractional_authored_geometry() {
     let mut fcx = create_font_context();
     let mut lcx: LayoutContext<ColorBrush> = LayoutContext::new();

@@ -63,6 +63,15 @@ impl<'a, B: Brush> Line<'a, B> {
         Some((baseline - metrics.ascent, baseline + metrics.descent))
     }
 
+    /// Returns the primary font's ascent and descent for this style span, in layout units.
+    ///
+    /// These retain the layout's metric quantization policy and exclude line-height leading,
+    /// descendant content and fallback glyph overflow. Returns `None` for an invalid style.
+    pub fn style_font_metrics(&self, style_index: usize) -> Option<(f32, f32)> {
+        let metrics = self.layout.data.style_metrics.get(style_index)?;
+        Some((metrics.ascent, metrics.descent))
+    }
+
     /// Returns the line item at the specified index.
     pub(crate) fn item(&self, index: usize) -> Option<LineItem<'a, B>> {
         let original_index = index;

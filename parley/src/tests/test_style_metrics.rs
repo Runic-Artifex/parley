@@ -962,6 +962,10 @@ fn style_content_bounds_use_own_font_metrics_not_descendant_or_atomic_extents() 
     let line = layout.lines().next().unwrap();
     let bounds = line.style_content_bounds(1).unwrap();
     let parent_metrics = metrics(&layout)[1];
+    assert_eq!(
+        line.style_font_metrics(1),
+        Some((parent_metrics.ascent, parent_metrics.descent))
+    );
     assert!((bounds.0 - (line.metrics().baseline - parent_metrics.ascent)).abs() < 1e-4);
     assert!((bounds.1 - (line.metrics().baseline + parent_metrics.descent)).abs() < 1e-4);
     assert!((bounds.1 - bounds.0) < line.metrics().line_height);
@@ -977,6 +981,8 @@ fn style_content_bounds_use_own_font_metrics_not_descendant_or_atomic_extents() 
     assert!(atomic.y < bounds.0);
     assert!(line.style_content_bounds(3).is_none());
     assert!(line.style_content_bounds(usize::MAX).is_none());
+    assert!(line.style_font_metrics(3).is_none());
+    assert!(line.style_font_metrics(usize::MAX).is_none());
 }
 
 #[test]
@@ -1067,13 +1073,13 @@ fn style_content_bounds_scale_covariantly_with_logical_quantization() {
         builder.pop_style_span();
         let (mut layout, _) = builder.build();
         layout.break_all_lines(None);
-        let (top, bottom) = layout
-            .lines()
-            .next()
-            .unwrap()
-            .style_content_bounds(1)
-            .unwrap();
-        (top / scale, bottom / scale)
+        let line = layout.lines().next().unwrap();
+        let (top, bottom) = line.style_content_bounds(1).unwrap();
+        let (ascent, descent) = line.style_font_metrics(1).unwrap();
+        assert!((bottom - top - ascent - descent).abs() < 1e-4);
+        assert_eq!((ascent / scale).fract(), 0.0);
+        assert_eq!((descent / scale).fract(), 0.0);
+        (top / scale, bottom / scale, ascent / scale, descent / scale)
     };
 
     let at_1 = bounds_at_scale(1.);
@@ -1081,6 +1087,8 @@ fn style_content_bounds_scale_covariantly_with_logical_quantization() {
         let at_scale = bounds_at_scale(scale);
         assert!((at_scale.0 - at_1.0).abs() < 1e-4);
         assert!((at_scale.1 - at_1.1).abs() < 1e-4);
+        assert!((at_scale.2 - at_1.2).abs() < 1e-4);
+        assert!((at_scale.3 - at_1.3).abs() < 1e-4);
     }
 }
 

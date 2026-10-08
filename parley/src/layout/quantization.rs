@@ -12,6 +12,10 @@ use core_maths::CoreFloat;
 /// rounds only font metrics in unscaled logical units, then scales them back
 /// to layout units. It leaves authored geometry and accumulated positions
 /// fractional.
+///
+/// Logical mode requires a finite, positive layout scale. Builders validate it
+/// when building, including when quantization is disabled. Disabling
+/// quantization leaves geometry unquantized in either mode.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum QuantizationMode {
     /// Quantize in layout (device) units.

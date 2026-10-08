@@ -50,6 +50,10 @@ pub(crate) fn assert_eq_layout_data<B: Brush>(a: &LayoutData<B>, b: &LayoutData<
 
     assert_eq!(a.scale, b.scale, "{case} scale mismatch");
     assert_eq!(a.quantize, b.quantize, "{case} quantize mismatch");
+    assert_eq!(
+        a.quantization_mode, b.quantization_mode,
+        "{case} quantization mode mismatch"
+    );
     assert_eq!(a.base_level, b.base_level, "{case} base_level mismatch");
     assert_eq!(a.text_len, b.text_len, "{case} text_len mismatch");
     assert_eq!(a.width, b.width, "{case} width mismatch");

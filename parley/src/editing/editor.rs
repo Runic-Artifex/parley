@@ -15,7 +15,10 @@ use core::{
 use crate::editing::{Cursor, Selection};
 use crate::layout::{Affinity, Alignment, AlignmentOptions, Layout};
 use crate::style::Brush;
-use crate::{BaseDirection, BoundingBox, FontContext, LayoutContext, StyleProperty, StyleSet};
+use crate::{
+    BaseDirection, BoundingBox, FontContext, LayoutContext, QuantizationMode, StyleProperty,
+    StyleSet,
+};
 
 /// Opaque representation of a generation.
 ///
@@ -101,6 +104,7 @@ where
     font_size: f32,
     scale: f32,
     quantize: bool,
+    quantization_mode: QuantizationMode,
     // Simple tracking of when the layout needs to be updated
     // before it can be used for `Selection` calculations or
     // for drawing.
@@ -133,6 +137,7 @@ where
             font_size,
             scale: 1.0,
             quantize: true,
+            quantization_mode: QuantizationMode::Device,
             layout_dirty: true,
             alignment: Alignment::Start,
             base_direction: BaseDirection::Auto,
@@ -149,7 +154,7 @@ mod tests {
     use super::PlainEditor;
     use crate::editing::Cursor;
     use crate::layout::{Affinity, Alignment, Cluster};
-    use crate::{FontContext, LayoutContext, StyleProperty};
+    use crate::{FontContext, LayoutContext, QuantizationMode, StyleProperty};
     use fontique::{Collection, CollectionOptions};
 
     #[test]
@@ -165,6 +170,15 @@ mod tests {
         let mut editor = PlainEditor::<()>::new(16.0);
         editor.set_text("aéz");
         editor.refresh_layout(&mut font_ctx, &mut layout_ctx);
+        assert!(!editor.layout_dirty);
+        editor.set_quantization_mode(QuantizationMode::Device);
+        assert!(!editor.layout_dirty);
+        editor.set_quantization_mode(QuantizationMode::Logical);
+        assert!(editor.layout_dirty);
+        editor.refresh_layout(&mut font_ctx, &mut layout_ctx);
+        assert!(!editor.layout_dirty);
+        editor.set_quantization_mode(QuantizationMode::Logical);
+        assert!(!editor.layout_dirty);
 
         // The collection has no fonts, so there are no shaped clusters to
         // canonicalize against. Initial selection is still the logical start
@@ -196,6 +210,10 @@ mod tests {
 
         editor.set_alignment(Alignment::Center);
         editor.edit_styles().insert(StyleProperty::FontSize(20.0));
+        editor.refresh_layout(&mut font_ctx, &mut layout_ctx);
+        assert_eq!(editor.raw_selection().text_range(), 1..3);
+
+        editor.set_quantization_mode(QuantizationMode::Device);
         editor.refresh_layout(&mut font_ctx, &mut layout_ctx);
         assert_eq!(editor.raw_selection().text_range(), 1..3);
     }
@@ -1089,6 +1107,17 @@ where
         self.layout_dirty = true;
     }
 
+    /// Sets the coordinate space used to quantize font metrics.
+    ///
+    /// This setting persists across layout refreshes. It only affects layouts
+    /// built with [`Self::set_quantize`] enabled.
+    pub fn set_quantization_mode(&mut self, mode: QuantizationMode) {
+        if self.quantization_mode != mode {
+            self.quantization_mode = mode;
+            self.layout_dirty = true;
+        }
+    }
+
     /// Modify the styles provided for this editor.
     pub fn edit_styles(&mut self) -> &mut StyleSet<T> {
         self.layout_dirty = true;
@@ -1256,6 +1285,7 @@ where
     fn update_layout(&mut self, font_cx: &mut FontContext, layout_cx: &mut LayoutContext<T>) {
         let mut builder =
             layout_cx.ranged_builder(font_cx, &self.buffer, self.scale, self.quantize);
+        builder.set_quantization_mode(self.quantization_mode);
         builder.set_base_direction(self.base_direction);
         for prop in self.default_style.inner().values() {
             builder.push_default(prop.to_owned());

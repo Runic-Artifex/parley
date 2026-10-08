@@ -14,14 +14,15 @@ use core::ops::{Bound, Range, RangeBounds};
 use parlance::BaseDirection;
 use parley_engine::break_overrides::LineBreakOverrideFn;
 
-use crate::InlineBoxKind;
 use crate::inline_box::{InlineBox, LayoutInlineBox};
 use crate::resolve::{ResolvedStyle, StyleRun};
+use crate::{InlineBoxKind, QuantizationMode};
 
 #[derive(Clone, Copy)]
 pub(crate) struct BuilderOptions<'a> {
     scale: f32,
     quantize: bool,
+    quantization_mode: QuantizationMode,
     base_direction: BaseDirection,
     line_break_override: Option<&'a LineBreakOverrideFn>,
 }
@@ -31,6 +32,7 @@ impl BuilderOptions<'_> {
         Self {
             scale,
             quantize,
+            quantization_mode: QuantizationMode::Device,
             base_direction: BaseDirection::Auto,
             line_break_override: None,
         }
@@ -81,6 +83,11 @@ impl<'b, B: Brush> RangedBuilder<'b, B> {
     /// The default is [`BaseDirection::Auto`], which infers the direction from the text.
     pub fn set_base_direction(&mut self, base_direction: BaseDirection) {
         self.options.base_direction = base_direction;
+    }
+
+    /// Sets the coordinate space used to quantize font metrics.
+    pub fn set_quantization_mode(&mut self, mode: QuantizationMode) {
+        self.options.quantization_mode = mode;
     }
 
     /// Set the callback which will be called as a first provider of line breaking decisions.
@@ -187,6 +194,11 @@ impl<'b, B: Brush> StyleRunBuilder<'b, B> {
         self.options.base_direction = base_direction;
     }
 
+    /// Sets the coordinate space used to quantize font metrics.
+    pub fn set_quantization_mode(&mut self, mode: QuantizationMode) {
+        self.options.quantization_mode = mode;
+    }
+
     /// Set the callback which will be called as a first provider of line breaking decisions.
     ///
     /// See [`LineBreakOverrideFn`] for more details.
@@ -291,6 +303,11 @@ impl<'b, B: Brush> TreeBuilder<'b, B> {
         self.options.base_direction = base_direction;
     }
 
+    /// Sets the coordinate space used to quantize font metrics.
+    pub fn set_quantization_mode(&mut self, mode: QuantizationMode) {
+        self.options.quantization_mode = mode;
+    }
+
     /// Set the callback which will be called as a first provider of line breaking decisions.
     ///
     /// See [`LineBreakOverrideFn`] for more details.
@@ -327,6 +344,11 @@ fn build_into_layout<B: Brush>(
     fcx: &mut FontContext,
     options: BuilderOptions<'_>,
 ) {
+    assert!(
+        options.quantization_mode != QuantizationMode::Logical
+            || (options.scale.is_finite() && options.scale > 0.),
+        "logical quantization requires a finite positive scale"
+    );
     if text.is_empty() && lcx.style_runs.is_empty() {
         lcx.style_table.push(ResolvedStyle::default());
         lcx.style_runs.push(StyleRun {
@@ -349,6 +371,7 @@ fn build_into_layout<B: Brush>(
     layout.data.clear();
     layout.data.scale = options.scale;
     layout.data.quantize = options.quantize;
+    layout.data.quantization_mode = options.quantization_mode;
     layout.data.base_level = lcx.analysis.paragraph_level();
     layout.data.text_len = text.len();
 
@@ -399,7 +422,7 @@ fn build_into_layout<B: Brush>(
         fcx,
         &lcx.style_table,
         &layout.data.shaped_text,
-        options.quantize,
+        layout.data.quantization(),
         &mut layout.data.style_metrics,
     );
 

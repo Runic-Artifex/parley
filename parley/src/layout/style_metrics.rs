@@ -33,6 +33,7 @@ use core_maths::CoreFloat;
 use fontique::{Query, QueryFamily};
 use parley_engine::{FontInstance, FontMetrics, ShapedText};
 
+use crate::layout::Quantization;
 use crate::resolve::{ResolveContext, ResolvedStyle};
 use crate::style::Brush;
 use crate::{AlignmentBaseline, BaselineShift, FontContext, FontData, InlineBox, VerticalAlign};
@@ -84,7 +85,7 @@ pub(crate) fn resolve_style_metrics<B: Brush>(
     fcx: &mut FontContext,
     styles: &[ResolvedStyle<B>],
     shaped_text: &ShapedText,
-    quantize: bool,
+    quantization: Quantization,
     out: &mut Vec<StyleMetrics>,
 ) {
     out.clear();
@@ -103,9 +104,9 @@ pub(crate) fn resolve_style_metrics<B: Brush>(
 
         let line_height = style
             .line_height
-            .resolve(style.font_size, &font_metrics, quantize);
+            .resolve(style.font_size, &font_metrics, quantization);
 
-        let mut metrics = StyleMetrics::from_font(&font_metrics, line_height, quantize);
+        let mut metrics = StyleMetrics::from_font(&font_metrics, line_height, quantization);
         metrics.font_size = style.font_size;
 
         if index == 0 {
@@ -138,11 +139,8 @@ pub(crate) fn resolve_style_metrics<B: Brush>(
                 metrics.exact_baseline_offset = parent.exact_baseline_offset + shift;
                 // Rounded once from the accumulated offset (not per level) so the total error
                 // stays within half a pixel.
-                metrics.baseline_offset = if quantize {
-                    metrics.exact_baseline_offset.round()
-                } else {
-                    metrics.exact_baseline_offset
-                };
+                metrics.baseline_offset =
+                    quantization.position_round(metrics.exact_baseline_offset);
                 metrics.aligned_subtree = parent.aligned_subtree;
             }
         }
@@ -198,21 +196,17 @@ pub(crate) struct BoxMetrics {
 impl BoxMetrics {
     /// The box of `font` expanded to `line_height`.
     ///
-    /// The half-leading is distributed as in CSS 2 §10.8.1. With `quantize`, ascent and descent
-    /// are rounded to whole pixels and the leading above the baseline is floored, mirroring how
-    /// text runs are placed.
-    pub(crate) fn from_font(font: &FontMetrics, line_height: f32, quantize: bool) -> Self {
-        let (ascent, descent) = if quantize {
-            (font.ascent.round(), font.descent.round())
-        } else {
-            (font.ascent, font.descent)
-        };
+    /// The half-leading is distributed as in CSS 2 §10.8.1 using the layout's quantization
+    /// policy for both font metrics and the leading above the baseline.
+    pub(crate) fn from_font(
+        font: &FontMetrics,
+        line_height: f32,
+        quantization: Quantization,
+    ) -> Self {
+        let ascent = quantization.font_round(font.ascent);
+        let descent = quantization.font_round(font.descent);
         let half_leading = (line_height - (ascent + descent)) / 2.;
-        let over = if quantize {
-            ascent + half_leading.floor()
-        } else {
-            ascent + half_leading
-        };
+        let over = ascent + quantization.half_leading_floor(half_leading);
         Self {
             ascent,
             descent,
@@ -226,8 +220,8 @@ impl StyleMetrics {
     /// The font-derived metrics of a span box: its [`BoxMetrics`] and x-height. The remaining
     /// fields describe the box's place in the style tree and are filled in by
     /// [`resolve_style_metrics`].
-    fn from_font(font: &FontMetrics, line_height: f32, quantize: bool) -> Self {
-        let box_metrics = BoxMetrics::from_font(font, line_height, quantize);
+    fn from_font(font: &FontMetrics, line_height: f32, quantization: Quantization) -> Self {
+        let box_metrics = BoxMetrics::from_font(font, line_height, quantization);
         // Fonts without an `OS/2.sxHeight` get the same estimate Gecko and Blink use
         // (`DEFAULT_XHEIGHT_FACTOR`); css-inline-3 §A.2 suggests measuring the `x` glyph or
         // `0.5em` instead, but this keeps us in line with browsers.
@@ -235,7 +229,7 @@ impl StyleMetrics {
         Self {
             ascent: box_metrics.ascent,
             descent: box_metrics.descent,
-            x_height: if quantize { x_height.round() } else { x_height },
+            x_height: quantization.position_round(x_height),
             over: box_metrics.over,
             under: box_metrics.under,
             line_height,
@@ -297,7 +291,7 @@ pub(crate) fn inline_box_placement(
     inline_box: &InlineBox,
     parent_style: u16,
     style_metrics: &[StyleMetrics],
-    quantize: bool,
+    quantization: Quantization,
 ) -> InlineBoxPlacement {
     let ascent = inline_box.baseline.unwrap_or(inline_box.height);
     let descent = inline_box.height - ascent;
@@ -309,11 +303,7 @@ pub(crate) fn inline_box_placement(
     let baseline_offset = parent.exact_baseline_offset + shift;
     InlineBoxPlacement {
         aligned_subtree: parent.aligned_subtree,
-        baseline_offset: if quantize {
-            baseline_offset.round()
-        } else {
-            baseline_offset
-        },
+        baseline_offset: quantization.position_round(baseline_offset),
         ascent,
         descent,
     }

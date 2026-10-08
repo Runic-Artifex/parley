@@ -89,18 +89,23 @@ impl LineHeight {
 
     /// The line height in layout units for text set in a font with `metrics` at `font_size`.
     ///
-    /// With `quantize`, the font's ascent, descent and leading are each rounded to whole pixels
-    /// before being summed for [`MetricsRelative`](Self::MetricsRelative), as browsers do for
-    /// `line-height: normal`, so that such lines are a whole number of pixels tall.
-    pub(crate) fn resolve(self, font_size: f32, metrics: &FontMetrics, quantize: bool) -> f32 {
+    /// The active quantization policy rounds ascent, descent and leading before summing
+    /// [`MetricsRelative`](Self::MetricsRelative) values, as browsers do for `line-height:
+    /// normal`.
+    pub(crate) fn resolve(
+        self,
+        font_size: f32,
+        metrics: &FontMetrics,
+        quantization: crate::layout::Quantization,
+    ) -> f32 {
         match self {
             Self::Absolute(value) => value,
             Self::FontSizeRelative(value) => value * font_size,
-            Self::MetricsRelative(value) if quantize => {
-                (metrics.ascent.round() + metrics.descent.round() + metrics.leading.round()) * value
-            }
             Self::MetricsRelative(value) => {
-                (metrics.ascent + metrics.descent + metrics.leading) * value
+                (quantization.font_round(metrics.ascent)
+                    + quantization.font_round(metrics.descent)
+                    + quantization.font_round(metrics.leading))
+                    * value
             }
         }
     }

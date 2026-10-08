@@ -7,6 +7,7 @@ mod alignment;
 mod cluster;
 mod line;
 mod line_break;
+mod quantization;
 mod run;
 mod spacing;
 pub(crate) mod style_metrics;
@@ -31,10 +32,12 @@ pub use line::{GlyphRun, Line, LineMetrics, PositionedInlineBox, PositionedLayou
 pub use line_break::{
     BoxBreakData, BreakLines, BreakerState, LineBreakData, MaxHeightBreakData, YieldData,
 };
+pub use quantization::QuantizationMode;
 pub use run::Run;
 
 pub(crate) use data::{LayoutData, LayoutItem, LayoutItemKind, LineData, LineItemData};
 pub(crate) use line::LineItem;
+pub(crate) use quantization::Quantization;
 pub(crate) use spacing::Spacing;
 
 // TODO - Deprecation not yet active to ease internal code migration.

@@ -138,6 +138,7 @@ pub use font::FontContext;
 pub use inline_box::{InlineBox, InlineBoxKind};
 #[doc(inline)]
 pub use layout::Layout;
+pub use layout::QuantizationMode;
 pub use util::BoundingBox;
 
 pub use editing::*;

@@ -8,7 +8,7 @@ use super::utils::fonts::{FONT_FAMILY_LIST, create_font_context};
 use crate::layout::style_metrics::StyleMetrics;
 use crate::{
     AlignmentBaseline, BaselineShift, FontFamily, InlineBox, InlineBoxKind, Layout, LayoutContext,
-    LineHeight, StyleProperty, TextStyle, VerticalAlign,
+    LineHeight, QuantizationMode, StyleProperty, TextStyle, VerticalAlign,
 };
 
 fn root_style() -> TextStyle<'static, 'static, ColorBrush> {
@@ -291,6 +291,137 @@ fn quantized_metrics_are_whole_pixels() {
     assert_eq!(root.over.fract(), 0.);
     assert_eq!(root.line_height.fract(), 0.);
     assert_eq!(root.under.fract(), 0.);
+}
+
+#[test]
+fn device_quantization_is_the_builder_default() {
+    let mut fcx = create_font_context();
+    let mut lcx: LayoutContext<ColorBrush> = LayoutContext::new();
+    let root = TextStyle {
+        font_size: 13.,
+        line_height: LineHeight::MetricsRelative(1.),
+        ..root_style()
+    };
+
+    let mut builder = lcx.tree_builder(&mut fcx, 1.25, true, &root);
+    builder.push_text("text");
+    let (mut default_layout, _) = builder.build();
+    default_layout.break_all_lines(None);
+
+    let mut builder = lcx.tree_builder(&mut fcx, 1.25, true, &root);
+    builder.set_quantization_mode(QuantizationMode::Device);
+    builder.push_text("text");
+    let (mut explicit_layout, _) = builder.build();
+    explicit_layout.break_all_lines(None);
+
+    assert_eq!(default_layout.data, explicit_layout.data);
+}
+
+#[test]
+fn logical_quantization_scales_font_metrics_covariantly() {
+    let root = TextStyle {
+        font_size: 13.,
+        line_height: LineHeight::MetricsRelative(1.),
+        ..root_style()
+    };
+    let mut fcx = create_font_context();
+    let mut lcx: LayoutContext<ColorBrush> = LayoutContext::new();
+    let mut metrics_at_scale = |scale: f32| {
+        let mut builder = lcx.tree_builder(&mut fcx, scale, true, &root);
+        builder.set_quantization_mode(QuantizationMode::Logical);
+        builder.push_text("text");
+        let (mut layout, _) = builder.build();
+        layout.break_all_lines(None);
+        let metrics = metrics(&layout)[0];
+        (
+            metrics.ascent / scale,
+            metrics.descent / scale,
+            metrics.over / scale,
+            metrics.under / scale,
+            metrics.line_height / scale,
+            layout.height() / scale,
+        )
+    };
+    let at_1 = metrics_at_scale(1.);
+    for scale in [1.25, 2.] {
+        let at_scale = metrics_at_scale(scale);
+        for (expected, actual) in [
+            (at_1.0, at_scale.0),
+            (at_1.1, at_scale.1),
+            (at_1.2, at_scale.2),
+            (at_1.3, at_scale.3),
+            (at_1.4, at_scale.4),
+            (at_1.5, at_scale.5),
+        ] {
+            assert!((expected - actual).abs() < 1e-4);
+        }
+    }
+}
+
+#[test]
+fn logical_quantization_preserves_fractional_authored_geometry() {
+    let mut fcx = create_font_context();
+    let mut lcx: LayoutContext<ColorBrush> = LayoutContext::new();
+    let root = TextStyle {
+        line_height: LineHeight::Absolute(15.5),
+        ..root_style()
+    };
+    let mut builder = lcx.tree_builder(&mut fcx, 1., true, &root);
+    builder.set_quantization_mode(QuantizationMode::Logical);
+    builder.push_text("a");
+    builder
+        .push_style_modification_span(&[StyleProperty::VerticalAlign(VerticalAlign::length(0.5))]);
+    builder.push_text("b");
+    builder.pop_style_span();
+    builder.push_inline_box(InlineBox {
+        id: 0,
+        kind: InlineBoxKind::InFlow,
+        index: 0,
+        width: 0.,
+        height: 25.5,
+        baseline: None,
+        vertical_align: VerticalAlign::TOP,
+    });
+    let (mut layout, _) = builder.build();
+    layout.break_all_lines(None);
+
+    assert_eq!(metrics(&layout)[0].line_height, 15.5);
+    assert_eq!(metrics(&layout)[1].baseline_offset, 0.5);
+    assert_eq!(layout.lines().next().unwrap().metrics().line_height, 25.5);
+
+    let mut builder = lcx.tree_builder(&mut fcx, 1., true, &root);
+    builder.set_quantization_mode(QuantizationMode::Logical);
+    builder.push_text("a\na");
+    let (mut lines_layout, _) = builder.build();
+    lines_layout.break_all_lines(None);
+    let second_line = lines_layout.lines().nth(1).unwrap();
+    assert_eq!(second_line.metrics().block_min_coord, 15.5);
+}
+
+#[test]
+fn quantize_false_ignores_quantization_mode() {
+    let mut fcx = create_font_context();
+    let mut lcx: LayoutContext<ColorBrush> = LayoutContext::new();
+    let root = TextStyle {
+        font_size: 13.,
+        line_height: LineHeight::MetricsRelative(1.),
+        ..root_style()
+    };
+
+    let mut builder = lcx.tree_builder(&mut fcx, 1.25, false, &root);
+    builder.push_text("text");
+    let (mut device_layout, _) = builder.build();
+    device_layout.break_all_lines(None);
+
+    let mut builder = lcx.tree_builder(&mut fcx, 1.25, false, &root);
+    builder.set_quantization_mode(QuantizationMode::Logical);
+    builder.push_text("text");
+    let (mut logical_layout, _) = builder.build();
+    logical_layout.break_all_lines(None);
+
+    let mut expected = device_layout.data.clone();
+    expected.quantization_mode = QuantizationMode::Logical;
+    assert_eq!(expected, logical_layout.data);
 }
 
 #[test]

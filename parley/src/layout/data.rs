@@ -5,7 +5,7 @@ use crate::inline_box::{InlineBox, LayoutInlineBox};
 use crate::layout::spacing::{Justification, Spacing};
 use crate::layout::style_metrics::{BoxMetrics, StyleMetrics};
 use crate::layout::whitespace::whitespace_hangs;
-use crate::layout::{ContentWidths, LineMetrics, Style};
+use crate::layout::{ContentWidths, LineMetrics, Quantization, QuantizationMode, Style};
 use crate::resolve::ResolvedStyle;
 use crate::style::Brush;
 use crate::{
@@ -58,13 +58,13 @@ pub(crate) struct RunData {
 pub(crate) fn run_box_metrics<B: Brush>(
     style: &Style<B>,
     shaped_run: &ShapedRun,
-    quantize: bool,
+    quantization: Quantization,
 ) -> Option<BoxMetrics> {
     match style.line_height {
         LineHeight::MetricsRelative(_) => {
             let (size, metrics) = (shaped_run.font_size, &shaped_run.font_metrics);
-            let line_height = style.line_height.resolve(size, metrics, quantize);
-            Some(BoxMetrics::from_font(metrics, line_height, quantize))
+            let line_height = style.line_height.resolve(size, metrics, quantization);
+            Some(BoxMetrics::from_font(metrics, line_height, quantization))
         }
         LineHeight::FontSizeRelative(_) | LineHeight::Absolute(_) => None,
     }
@@ -200,6 +200,8 @@ pub(crate) struct LayoutData<B: Brush> {
     pub(crate) scale: f32,
     /// Whether metrics should be quantized to pixel boundaries
     pub(crate) quantize: bool,
+    /// Coordinate space used when metrics are quantized.
+    pub(crate) quantization_mode: QuantizationMode,
     /// Whether every line begins with the root span box (the CSS "strut").
     pub(crate) include_root_strut: bool,
     /// The `BiDi` base level
@@ -250,6 +252,7 @@ impl<B: Brush> Default for LayoutData<B> {
         Self {
             scale: 1.,
             quantize: true,
+            quantization_mode: QuantizationMode::Device,
             include_root_strut: true,
             base_level: BidiLevel::new(0),
             text_len: 0,
@@ -274,9 +277,14 @@ impl<B: Brush> Default for LayoutData<B> {
 }
 
 impl<B: Brush> LayoutData<B> {
+    pub(crate) fn quantization(&self) -> Quantization {
+        Quantization::new(self.quantize, self.quantization_mode, self.scale)
+    }
+
     pub(crate) fn clear(&mut self) {
         self.scale = 1.;
         self.quantize = true;
+        self.quantization_mode = QuantizationMode::Device;
         self.include_root_strut = true;
         self.base_level = BidiLevel::new(0);
         self.text_len = 0;
@@ -325,10 +333,11 @@ impl<B: Brush> LayoutData<B> {
         let style_index =
             self.shaped_text.characters()[shaped_run.characters_range.start as usize].style_index;
 
+        let quantization = self.quantization();
         let line_height = self.styles[style_index as usize].line_height.resolve(
             shaped_run.font_size,
             &shaped_run.font_metrics,
-            self.quantize,
+            quantization,
         );
 
         // The run's box metrics, if it's uniform across all the styles within the run. A run's box
@@ -346,7 +355,7 @@ impl<B: Brush> LayoutData<B> {
                 run_box_metrics(
                     &self.styles[usize::from(first_style)],
                     shaped_run,
-                    self.quantize,
+                    quantization,
                 )
             } else {
                 None

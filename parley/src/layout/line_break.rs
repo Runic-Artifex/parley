@@ -10,6 +10,7 @@ use alloc::vec::Vec;
 use core_maths::CoreFloat;
 use parlance::BidiLevel;
 
+use crate::layout::Quantization;
 use crate::layout::data::{AlignedSubtreeOffset, run_box_metrics};
 use crate::layout::spacing::{EffectiveSpacing, Justification, is_word_separator};
 use crate::layout::style_metrics::{InlineBoxPlacement, StyleMetrics, inline_box_placement};
@@ -366,7 +367,7 @@ impl LineBoxMetrics {
         let shaped_run = &data.shaped_text.runs()[run_idx];
         let Some(run_box) = data.runs[run_idx]
             .run_box
-            .or_else(|| run_box_metrics(&data.styles[style], shaped_run, data.quantize))
+            .or_else(|| run_box_metrics(&data.styles[style], shaped_run, data.quantization()))
         else {
             return;
         };
@@ -406,8 +407,13 @@ impl LineBoxMetrics {
 
     /// Add an inline box with `vertical-align: top | bottom`, which only constrains the line
     /// box's height.
-    fn add_line_relative_inline_box(&mut self, align: VerticalAlign, height: f32, quantize: bool) {
-        let height = if quantize { height.round() } else { height };
+    fn add_line_relative_inline_box(
+        &mut self,
+        align: VerticalAlign,
+        height: f32,
+        quantization: Quantization,
+    ) {
+        let height = quantization.position_round(height);
         if height > 0. {
             self.has_content = true;
         }
@@ -617,7 +623,7 @@ impl BreakerState {
         next_x: f32,
         inline_box: &InlineBox,
         placement: InlineBoxPlacement,
-        quantize: bool,
+        quantization: Quantization,
     ) {
         self.item_idx += 1;
         self.line.items.end += 1;
@@ -626,7 +632,7 @@ impl BreakerState {
             self.line.box_metrics.add_line_relative_inline_box(
                 inline_box.vertical_align,
                 inline_box.height,
-                quantize,
+                quantization,
             );
         } else {
             self.line.box_metrics.add_inline_box(
@@ -784,7 +790,7 @@ impl<'a, B: Brush> BreakLines<'a, B> {
     /// Add the layout's inline box `index` to the current line. Out-of-flow boxes contribute
     /// nothing to the line's metrics.
     fn append_layout_inline_box(&mut self, index: usize, next_x: f32) {
-        let quantize = self.layout.data.quantize;
+        let quantization = self.layout.data.quantization();
         let layout_box = &mut self.layout.data.inline_boxes[index];
         let inline_box = &layout_box.inline_box;
         if inline_box.kind == InlineBoxKind::InFlow {
@@ -792,11 +798,15 @@ impl<'a, B: Brush> BreakLines<'a, B> {
                 inline_box,
                 layout_box.parent_style_index,
                 &self.layout.data.style_metrics,
-                quantize,
+                quantization,
             );
             layout_box.baseline_offset = placement.baseline_offset;
-            self.state
-                .append_aligned_inline_box_to_line(next_x, inline_box, placement, quantize);
+            self.state.append_aligned_inline_box_to_line(
+                next_x,
+                inline_box,
+                placement,
+                quantization,
+            );
         } else {
             self.state
                 .append_inline_box_to_line(next_x, f32::NEG_INFINITY, f32::NEG_INFINITY);
@@ -1395,8 +1405,7 @@ impl<'a, B: Brush> BreakLines<'a, B> {
             line.text_range = self.layout.data.text_len..self.layout.data.text_len;
         }
 
-        // Whether metrics should be quantized to pixel boundaries
-        let quantize = self.layout.data.quantize;
+        let quantization = self.layout.data.quantization();
 
         if line.item_range.is_empty() && line_idx > 0 {
             // If we have no items on this line, it must be the last (empty)
@@ -1487,7 +1496,7 @@ impl<'a, B: Brush> BreakLines<'a, B> {
                 BaselineShift::Bottom => extents.under - line_box_extents.under,
                 _ => line_box_extents.over - extents.over,
             };
-            let offset = if quantize { offset.round() } else { offset };
+            let offset = quantization.position_round(offset);
             offsets.push(AlignedSubtreeOffset {
                 root: subtree.root,
                 baseline_offset: offset,
@@ -1511,24 +1520,13 @@ impl<'a, B: Brush> BreakLines<'a, B> {
             );
         }
 
-        let top = if quantize {
-            self.state.line_y.round() as f32
-        } else {
-            self.state.line_y as f32
-        };
+        let top = quantization.position_round_f64(self.state.line_y) as f32;
         line.metrics.baseline = top + line_box_extents.over;
         line.metrics.block_min_coord = top;
-        line.metrics.block_max_coord = if quantize {
-            // TODO: perhaps this should be something like the following, to ensure quantized line
-            // boxes tile exactly without gaps or overlap. However, that would cause some
-            // line height asserts to fail in the tests.
-            // ```
-            // (self.state.line_y as f32 + self.state.line.box_metrics.line_height()).round()
-            // ```
-            (line.metrics.baseline + line_box_extents.under).round()
-        } else {
-            line.metrics.baseline + line_box_extents.under
-        };
+        // Device quantization keeps the existing independently rounded line bottom. Logical
+        // quantization leaves accumulated positions fractional.
+        line.metrics.block_max_coord =
+            quantization.position_round(line.metrics.baseline + line_box_extents.under);
         line.metrics.content_block_min_coord = line.metrics.baseline - content_box_extents.over;
         line.metrics.content_block_max_coord = line.metrics.baseline + content_box_extents.under;
 

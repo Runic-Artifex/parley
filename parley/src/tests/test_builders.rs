@@ -15,9 +15,9 @@ use super::utils::{
 };
 use crate::{
     BaseDirection, BreakReason, FontContext, FontFamily, FontFeatures, FontVariations, Layout,
-    LayoutContext, LineBreak, LineHeight, OverflowWrap, RangedBuilder, StyleProperty,
-    StyleRunBuilder, TextStyle, TextWrapMode, TreeBuilder, VerticalAlign, WhiteSpaceCollapse,
-    WordBreak,
+    LayoutContext, LineBreak, LineHeight, OverflowWrap, QuantizationMode, RangedBuilder,
+    StyleProperty, StyleRunBuilder, TextStyle, TextWrapMode, TreeBuilder, VerticalAlign,
+    WhiteSpaceCollapse, WordBreak,
 };
 
 /// Set of options for [`build_layout_with_ranged`].
@@ -560,6 +560,24 @@ fn ranged_builder_reuse_layout() {
         &layout.data,
         "Expected reused layout to be identical to fresh layout",
     );
+}
+
+#[test]
+fn builder_reuse_restores_device_quantization_mode() {
+    let mut fcx = create_font_context();
+    let mut lcx: LayoutContext<ColorBrush> = LayoutContext::new();
+    let mut layout = Layout::new();
+
+    let mut builder = lcx.ranged_builder(&mut fcx, "first", 1., true);
+    builder.set_quantization_mode(QuantizationMode::Logical);
+    builder.push_default(FontFamily::from(FONT_FAMILY_LIST));
+    builder.build_into(&mut layout, "first");
+    assert_eq!(layout.data.quantization_mode, QuantizationMode::Logical);
+
+    let mut builder = lcx.ranged_builder(&mut fcx, "second", 1., true);
+    builder.push_default(FontFamily::from(FONT_FAMILY_LIST));
+    builder.build_into(&mut layout, "second");
+    assert_eq!(layout.data.quantization_mode, QuantizationMode::Device);
 }
 
 #[test]

@@ -1083,10 +1083,12 @@ where
         self.font_size
     }
 
-    /// Set whether to quantize the layout coordinates.
+    /// Set whether to quantize using the selected [`QuantizationMode`].
     ///
-    /// Set `quantize` as `true` to have the layout coordinates aligned to pixel boundaries.
+    /// In the default device mode, set `quantize` as `true` to align layout coordinates to pixel boundaries.
     /// That is the easiest way to avoid blurry text and to receive ready-to-paint layout metrics.
+    /// Logical mode instead quantizes font metrics before scaling and preserves fractional
+    /// authored geometry and accumulated positions. The renderer owns device rasterization.
     ///
     /// For advanced rendering use cases you can set `quantize` as `false` and receive
     /// fractional coordinates. This ensures the most accurate results if you want to perform

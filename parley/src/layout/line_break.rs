@@ -71,6 +71,8 @@ impl LineLayout {
 
 #[derive(Clone, Default)]
 struct LineState {
+    empty_spans: Range<usize>,
+    boxes_processed: usize,
     x: f32,
     items: Range<usize>,
     /// The line's shaped clusters, as a range into [`parley_engine::ShapedText::shaped_clusters`].
@@ -98,6 +100,7 @@ struct LineState {
 impl LineState {
     /// Reset the per-line running state in preparation for building a new line.
     fn reset(&mut self) {
+        self.empty_spans.start = self.empty_spans.end;
         self.x = 0.0;
         self.box_metrics.reset();
         self.num_word_separators = 0;
@@ -522,6 +525,23 @@ impl Default for BreakerState {
 }
 
 impl BreakerState {
+    /// Empty spans are consumed before the following break opportunity. This range is part of
+    /// the saved line state, so rollback and explicit replay restore both metrics and ownership.
+    fn append_empty_spans<B: Brush>(&mut self, index: usize, data: &LayoutData<B>) {
+        while let Some(span) = data.empty_spans.get(self.line.empty_spans.end) {
+            if span.index > index
+                || (span.index == index && span.boxes_before > self.line.boxes_processed)
+            {
+                break;
+            }
+            self.line
+                .box_metrics
+                .add_style(span.style, data, &mut self.contributed);
+            self.line.empty_spans.end += 1;
+        }
+        self.update_max_height_exceeded();
+    }
+
     /// Add the atom currently being evaluated to the current line.
     ///
     /// `style_index` is the style of the atom's first character. The span boxes of the atom's
@@ -537,6 +557,10 @@ impl BreakerState {
         data: &LayoutData<B>,
         is_word_separator: bool,
     ) {
+        // An anchor within a shaping atom participates without splitting that atom.
+        if let Some(last) = atom.characters().last() {
+            self.append_empty_spans(last.text_byte_range().end.saturating_sub(1), data);
+        }
         self.line.items.end = self.item_idx + 1;
         self.line.clusters.end = atom.shaped_clusters_range().end;
         self.cluster_idx = atom.shaped_clusters_range().end;
@@ -559,6 +583,7 @@ impl BreakerState {
     /// baseline respectively. A box with its bottom aligned to the baseline is simply one with a
     /// zero descent. The box grows the line only insofar as it extends beyond the text.
     pub fn append_inline_box_to_line(&mut self, next_x: f32, ascent: f32, descent: f32) {
+        self.line.boxes_processed += 1;
         self.item_idx += 1;
         self.line.items.end += 1;
         self.line.x = next_x;
@@ -578,6 +603,7 @@ impl BreakerState {
         placement: InlineBoxPlacement,
         quantization: Quantization,
     ) {
+        self.line.boxes_processed += 1;
         self.item_idx += 1;
         self.line.items.end += 1;
         self.line.x = next_x;
@@ -752,6 +778,10 @@ impl<'a, B: Brush> BreakLines<'a, B> {
     /// Add the layout's inline box `index` to the current line. Out-of-flow boxes contribute
     /// nothing to the line's metrics.
     fn append_layout_inline_box(&mut self, index: usize, next_x: f32) {
+        self.state.append_empty_spans(
+            self.layout.data.inline_boxes[index].inline_box.index,
+            &self.layout.data,
+        );
         let quantization = self.layout.data.quantization();
         let layout_box = &mut self.layout.data.inline_boxes[index];
         let inline_box = &layout_box.inline_box;
@@ -812,7 +842,13 @@ impl<'a, B: Brush> BreakLines<'a, B> {
         // zero height; the strut only applies once the line has content. The trailing empty line
         // after a final newline has no items and keeps the strut so the cursor has a position.
         let invisible = !self.state.line.box_metrics.has_content
-            && !self.lines.lines.last().unwrap().item_range.is_empty();
+            && !self.lines.lines.last().unwrap().item_range.is_empty()
+            || (self.layout.data.text_len == 0
+                && !self.state.line.empty_spans.is_empty()
+                && self.layout.data.inline_boxes.iter().all(|item| {
+                    item.inline_box.kind != InlineBoxKind::InFlow
+                        || (item.inline_box.width == 0. && item.inline_box.height == 0.)
+                }));
         let line_height = if invisible {
             0.
         } else {
@@ -854,7 +890,11 @@ impl<'a, B: Brush> BreakLines<'a, B> {
     fn max_height_break_data(&self, line_height: f32) -> Option<YieldData> {
         Some(YieldData::MaxHeightExceeded(MaxHeightBreakData {
             advance: self.state.line.x,
-            line_height,
+            line_height: if self.state.line.empty_spans.is_empty() {
+                line_height
+            } else {
+                line_height.max(self.state.line.box_metrics.line_height())
+            },
         }))
     }
 
@@ -962,6 +1002,8 @@ impl<'a, B: Brush> BreakLines<'a, B> {
             match item.kind {
                 LayoutItemKind::InlineBox => {
                     let inline_box = &self.layout.data.inline_boxes[item.index].inline_box;
+                    self.state
+                        .append_empty_spans(inline_box.index, &self.layout.data);
 
                     // In-flow boxes are aligned relative to their containing style's span box
                     // (see `append_aligned_inline_box_to_line`). Out-of-flow boxes are not in-flow
@@ -989,7 +1031,10 @@ impl<'a, B: Brush> BreakLines<'a, B> {
                     let next_x = self.state.line.x + width_contribution;
 
                     let box_will_be_appended = next_x <= max_advance || self.state.line.x == 0.0;
-                    if height_contribution > self.state.line_max_height && box_will_be_appended {
+                    if (height_contribution > self.state.line_max_height
+                        || self.state.line.max_height_exceeded)
+                        && box_will_be_appended
+                    {
                         return self.max_height_break_data(height_contribution);
                     }
 
@@ -1027,6 +1072,10 @@ impl<'a, B: Brush> BreakLines<'a, B> {
 
                     // Iterate over the remaining atoms in the Run
                     for atom in slice.atoms_from(self.state.cluster_idx) {
+                        self.state.append_empty_spans(
+                            atom.characters()[0].text_byte_start as usize,
+                            &self.layout.data,
+                        );
                         // Retrieve metadata about the atom
                         let first_character = &atom.characters()[0];
                         let whitespace = first_character.whitespace;
@@ -1185,6 +1234,8 @@ impl<'a, B: Brush> BreakLines<'a, B> {
             self.state.line.items.end = 1;
         }
         self.done = true;
+        self.state
+            .append_empty_spans(self.layout.data.text_len, &self.layout.data);
         self.start_new_line(BreakReason::None, max_advance, line_indent)
     }
 
@@ -1230,6 +1281,7 @@ impl<'a, B: Brush> BreakLines<'a, B> {
                         return Some(());
                     }
 
+                    let text_index = inline_box.index;
                     // Compute the x position for the line width tracking
                     let next_x = self.state.line.x + inline_box.width;
                     self.append_layout_inline_box(item.index, next_x);
@@ -1237,6 +1289,7 @@ impl<'a, B: Brush> BreakLines<'a, B> {
 
                     // Check if we've reached the limit after adding this box
                     if char_count >= max_chars {
+                        self.state.append_empty_spans(text_index, &self.layout.data);
                         // Check if we've consumed all content (this is the last line).
                         let is_last_item = self.state.item_idx >= self.layout.data.items.len();
                         let break_reason = if is_last_item {
@@ -1261,6 +1314,10 @@ impl<'a, B: Brush> BreakLines<'a, B> {
                     let cluster_end = shaped_run.shaped_clusters_range.end;
 
                     for atom in slice.atoms_from(self.state.cluster_idx) {
+                        self.state.append_empty_spans(
+                            atom.characters()[0].text_byte_start as usize,
+                            &self.layout.data,
+                        );
                         // Check if we should break before this atom
                         if char_count >= max_chars && max_chars != 0 {
                             self.start_new_line(BreakReason::Regular, f32::MAX, line_indent);
@@ -1291,6 +1348,12 @@ impl<'a, B: Brush> BreakLines<'a, B> {
 
                         // Check if we've reached the limit after adding this atom
                         if char_count >= max_chars {
+                            if let Some(last) = atom.characters().last() {
+                                self.state.append_empty_spans(
+                                    last.text_byte_range().end,
+                                    &self.layout.data,
+                                );
+                            }
                             // Determine the break reason:
                             // - BreakReason::None for the last line (end of content)
                             // - BreakReason::Explicit if this line ends with a newline
@@ -1307,6 +1370,10 @@ impl<'a, B: Brush> BreakLines<'a, B> {
                             };
 
                             if break_reason == BreakReason::None {
+                                self.state.append_empty_spans(
+                                    self.layout.data.text_len,
+                                    &self.layout.data,
+                                );
                                 self.done = true;
                             }
                             self.start_new_line(break_reason, f32::MAX, line_indent);
@@ -1324,6 +1391,8 @@ impl<'a, B: Brush> BreakLines<'a, B> {
             self.state.line.items.end = 1;
         }
         self.done = true;
+        self.state
+            .append_empty_spans(self.layout.data.text_len, &self.layout.data);
         self.start_new_line(BreakReason::None, f32::MAX, line_indent);
         Some(())
     }
@@ -1706,6 +1775,7 @@ fn commit_line<B: Brush>(
     }
 
     lines.lines.push(LineData {
+        empty_spans: state.empty_spans.clone(),
         item_range: start_item_idx..end_item_idx,
         text_range: text_start..text_end,
         max_advance,

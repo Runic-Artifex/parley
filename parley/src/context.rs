@@ -177,6 +177,7 @@ impl<B: Brush> LayoutContext<B> {
         fcx.source_cache.prune(128, false);
 
         TreeBuilder {
+            retain_empty_spans: false,
             options: BuilderOptions::new(scale, quantize),
             lcx: self,
             fcx,

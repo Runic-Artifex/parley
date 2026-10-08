@@ -8,7 +8,7 @@ use super::utils::fonts::{FONT_FAMILY_LIST, create_font_context};
 use crate::layout::style_metrics::StyleMetrics;
 use crate::{
     AlignmentBaseline, BaselineShift, FontFamily, InlineBox, InlineBoxKind, Layout, LayoutContext,
-    LineHeight, QuantizationMode, StyleProperty, TextStyle, VerticalAlign,
+    LineHeight, QuantizationMode, StyleProperty, TextStyle, VerticalAlign, WhiteSpaceCollapse,
 };
 
 fn root_style() -> TextStyle<'static, 'static, ColorBrush> {
@@ -1404,5 +1404,430 @@ fn breaking_after_reverting_to_a_default_state_does_not_panic() {
     assert!(layout.len() >= 4);
     for line in layout.lines() {
         assert!(line.metrics().line_height > 0.);
+    }
+}
+
+fn empty_span_replay_layout(
+    fcx: &mut crate::FontContext,
+    lcx: &mut LayoutContext<ColorBrush>,
+) -> Layout<ColorBrush> {
+    let root = root_style();
+    let mut builder = lcx.tree_builder(fcx, 1., false, &root);
+    builder.set_empty_span_participation(true);
+    builder.push_text("a ");
+    builder.push_style_span(TextStyle {
+        font_size: 32.,
+        line_height: LineHeight::Absolute(40.),
+        ..root_style()
+    });
+    builder.pop_style_span();
+    builder.push_text("b\n");
+    builder.push_style_span(TextStyle {
+        font_size: 12.,
+        line_height: LineHeight::Absolute(18.),
+        vertical_align: VerticalAlign::SUPER,
+        ..root_style()
+    });
+    builder.pop_style_span();
+    builder.push_text("c");
+    builder.build().0
+}
+
+fn empty_span_styles(layout: &Layout<ColorBrush>) -> alloc::vec::Vec<alloc::vec::Vec<usize>> {
+    layout
+        .lines()
+        .map(|line| line.empty_spans().map(|(style, _)| style).collect())
+        .collect()
+}
+
+#[test]
+fn empty_span_participation_is_opt_in_and_builder_local() {
+    let mut fcx = create_font_context();
+    let mut lcx = LayoutContext::new();
+
+    let root = root_style();
+    let mut disabled = lcx.tree_builder(&mut fcx, 1., false, &root);
+    disabled.push_text("x");
+    disabled.push_style_span(TextStyle {
+        font_size: 40.,
+        line_height: LineHeight::Absolute(50.),
+        ..root_style()
+    });
+    disabled.pop_style_span();
+    disabled.push_style_modification_span(&[StyleProperty::VerticalAlign(VerticalAlign::SUPER)]);
+    disabled.pop_style_span();
+    let (mut disabled, text) = disabled.build();
+    assert_eq!(text, "x");
+    disabled.break_all_lines(None);
+    assert!(
+        disabled
+            .lines()
+            .next()
+            .unwrap()
+            .empty_spans()
+            .next()
+            .is_none()
+    );
+
+    let root = root_style();
+    let mut enabled = lcx.tree_builder(&mut fcx, 1., false, &root);
+    enabled.set_empty_span_participation(true);
+    enabled.push_text("x");
+    enabled.push_style_span(TextStyle {
+        font_size: 40.,
+        line_height: LineHeight::Absolute(50.),
+        ..root_style()
+    });
+    enabled.pop_style_span();
+    enabled.push_style_modification_span(&[StyleProperty::VerticalAlign(VerticalAlign::SUPER)]);
+    enabled.pop_style_span();
+    let (mut enabled, text) = enabled.build();
+    assert_eq!(text, "x");
+    enabled.break_all_lines(None);
+    let spans = enabled
+        .lines()
+        .next()
+        .unwrap()
+        .empty_spans()
+        .collect::<alloc::vec::Vec<_>>();
+    assert_eq!(spans.len(), 1);
+    assert_eq!(spans[0].0, 1);
+
+    // The setting is per builder: turning it back off and starting a fresh builder retain nothing.
+    let root = root_style();
+    let mut switched_off = lcx.tree_builder(&mut fcx, 1., false, &root);
+    switched_off.set_empty_span_participation(true);
+    switched_off.set_empty_span_participation(false);
+    switched_off.push_text("x");
+    switched_off.push_style_span(TextStyle {
+        font_size: 32.,
+        ..root_style()
+    });
+    switched_off.pop_style_span();
+    let (mut switched_off, _) = switched_off.build();
+    switched_off.break_all_lines(None);
+    assert!(
+        switched_off
+            .lines()
+            .next()
+            .unwrap()
+            .empty_spans()
+            .next()
+            .is_none()
+    );
+
+    let root = root_style();
+    let mut fresh = lcx.tree_builder(&mut fcx, 1., false, &root);
+    fresh.push_text("x");
+    fresh.push_style_span(TextStyle {
+        font_size: 32.,
+        ..root_style()
+    });
+    fresh.pop_style_span();
+    let (mut fresh, _) = fresh.build();
+    fresh.break_all_lines(None);
+    assert!(fresh.lines().next().unwrap().empty_spans().next().is_none());
+}
+
+#[test]
+fn empty_span_participation_follows_pending_space_normalization() {
+    let mut fcx = create_font_context();
+    let mut lcx = LayoutContext::new();
+    let root = TextStyle {
+        white_space_collapse: WhiteSpaceCollapse::Collapse,
+        ..root_style()
+    };
+    let mut builder = lcx.tree_builder(&mut fcx, 1., false, &root);
+    builder.set_empty_span_participation(true);
+    builder.push_text_with_source("before ", 10);
+    builder.push_style_span(TextStyle {
+        font_size: 28.,
+        line_height: LineHeight::Absolute(34.),
+        // The span opens while the prior collapsed space is pending. It must use the same
+        // collapsing mode, otherwise that boundary intentionally preserves both spaces.
+        white_space_collapse: WhiteSpaceCollapse::Collapse,
+        ..root_style()
+    });
+    builder.pop_style_span();
+    builder.push_text_with_source(" after", 11);
+    let mut layout = Layout::default();
+    let (text, sources) = builder.build_into_with_sources(&mut layout);
+    assert_eq!(text, "before after");
+    assert_eq!(
+        sources,
+        alloc::vec![
+            crate::TextSourceRange {
+                range: 0..7,
+                source: 10
+            },
+            crate::TextSourceRange {
+                range: 7..12,
+                source: 11
+            },
+        ]
+    );
+    layout.break_all_lines(None);
+
+    let line = layout.lines().next().unwrap();
+    let participant = line.empty_spans().collect::<alloc::vec::Vec<_>>();
+    assert_eq!(participant.len(), 1);
+    assert_eq!(participant[0].0, 1);
+    let after_space = crate::Cluster::from_byte_index(&layout, 7)
+        .unwrap()
+        .visual_offset()
+        .unwrap();
+    assert_close(participant[0].1, after_space);
+}
+
+#[test]
+fn empty_nested_spans_contribute_their_own_metrics() {
+    let mut fcx = create_font_context();
+    let mut lcx = LayoutContext::new();
+    let root = root_style();
+    let mut builder = lcx.tree_builder(&mut fcx, 1., true, &root);
+    builder.set_quantization_mode(QuantizationMode::Logical);
+    builder.set_empty_span_participation(true);
+    builder.push_style_span(TextStyle {
+        font_size: 40.,
+        line_height: LineHeight::Absolute(50.),
+        ..root_style()
+    });
+    builder.push_style_span(TextStyle {
+        font_size: 10.,
+        line_height: LineHeight::Absolute(16.),
+        vertical_align: VerticalAlign::SUPER,
+        ..root_style()
+    });
+    builder.pop_style_span();
+    builder.pop_style_span();
+    builder.push_text("x");
+    let (mut layout, _) = builder.build();
+    layout.break_all_lines(None);
+
+    let line = layout.lines().next().unwrap();
+    assert_eq!(
+        line.empty_spans()
+            .map(|(style, _)| style)
+            .collect::<alloc::vec::Vec<_>>(),
+        alloc::vec![1, 2]
+    );
+    for style in [1, 2] {
+        let metrics = metrics(&layout)[style];
+        let (top, bottom) = line.style_content_bounds(style).unwrap();
+        assert_close(top, line.style_baseline(style as u16) - metrics.ascent);
+        assert_close(bottom, line.style_baseline(style as u16) + metrics.descent);
+    }
+    assert!(line.metrics().line_height >= metrics(&layout)[1].line_height);
+    assert!(line.style_baseline(1) > line.style_baseline(2));
+}
+
+#[test]
+fn empty_spans_follow_wrap_explicit_breaks_and_length_replay() {
+    let mut fcx = create_font_context();
+    let mut lcx = LayoutContext::new();
+    let mut wrapped = empty_span_replay_layout(&mut fcx, &mut lcx);
+    wrapped.break_all_lines(None);
+    let b = crate::Cluster::from_byte_index(&wrapped, 2).unwrap();
+    let wrap_width = b.visual_offset().unwrap() + b.advance() / 2.;
+    wrapped.break_all_lines(Some(wrap_width));
+    assert_eq!(
+        empty_span_styles(&wrapped),
+        alloc::vec![alloc::vec![1], alloc::vec![], alloc::vec![2]]
+    );
+
+    let mut replayed = empty_span_replay_layout(&mut fcx, &mut lcx);
+    let mut breaker = replayed.break_lines();
+    assert!(breaker.break_next_with_length(1).is_some());
+    let saved = breaker.state().clone();
+    assert!(breaker.break_next_with_length(1).is_some());
+    breaker.revert_to(saved);
+    while breaker.break_next_with_length(1).is_some() {}
+    breaker.finish();
+    assert_eq!(
+        empty_span_styles(&replayed),
+        alloc::vec![
+            alloc::vec![],
+            alloc::vec![1],
+            alloc::vec![],
+            alloc::vec![2],
+            alloc::vec![]
+        ]
+    );
+}
+
+#[test]
+fn empty_spans_preserve_same_byte_inline_box_order_and_outflow_parents() {
+    let mut fcx = create_font_context();
+    let mut lcx = LayoutContext::new();
+    let root = root_style();
+    let mut builder = lcx.tree_builder(&mut fcx, 1., false, &root);
+    builder.set_empty_span_participation(true);
+    builder.push_text("a");
+    builder.push_style_span(TextStyle {
+        font_size: 30.,
+        line_height: LineHeight::Absolute(36.),
+        ..root_style()
+    });
+    builder.pop_style_span();
+    builder.push_inline_box(InlineBox {
+        id: 1,
+        kind: InlineBoxKind::InFlow,
+        index: 0,
+        width: 11.,
+        height: 14.,
+        baseline: Some(11.),
+        vertical_align: VerticalAlign::BASELINE,
+    });
+    builder.push_style_span(TextStyle {
+        font_size: 16.,
+        line_height: LineHeight::Absolute(22.),
+        ..root_style()
+    });
+    builder.pop_style_span();
+    builder.push_style_span(TextStyle {
+        font_size: 26.,
+        line_height: LineHeight::Absolute(32.),
+        ..root_style()
+    });
+    builder.push_inline_box(InlineBox {
+        id: 2,
+        kind: InlineBoxKind::CustomOutOfFlow,
+        index: 0,
+        width: 0.,
+        height: 0.,
+        baseline: None,
+        vertical_align: VerticalAlign::BASELINE,
+    });
+    builder.pop_style_span();
+    builder.push_text("b");
+    let (mut layout, _) = builder.build();
+    layout.break_all_lines(None);
+
+    let line = layout.lines().next().unwrap();
+    let spans = line.empty_spans().collect::<alloc::vec::Vec<_>>();
+    assert_eq!(spans.len(), 3);
+    assert_close(metrics(&layout)[spans[0].0].font_size, 30.);
+    assert_close(metrics(&layout)[spans[1].0].font_size, 16.);
+    assert_close(metrics(&layout)[spans[2].0].font_size, 26.);
+
+    let inline = line
+        .items()
+        .find_map(|item| match item {
+            crate::PositionedLayoutItem::InlineBox(inline_box) if inline_box.id == 1 => {
+                Some(inline_box)
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert_close(spans[0].1, inline.x);
+    assert_close(spans[1].1, inline.x + inline.width);
+    assert_close(spans[2].1, inline.x + inline.width);
+}
+
+#[test]
+fn empty_span_participants_do_not_add_shaping_or_provenance_seams() {
+    let mut fcx = create_font_context();
+    let mut lcx = LayoutContext::new();
+    let build = |retain_empty_spans: bool,
+                 fcx: &mut crate::FontContext,
+                 lcx: &mut LayoutContext<ColorBrush>| {
+        let root = root_style();
+        let mut builder = lcx.tree_builder(fcx, 1., false, &root);
+        builder.set_empty_span_participation(retain_empty_spans);
+        builder.push_text_with_source("of", 20);
+        builder.push_style_span(TextStyle {
+            font_size: 42.,
+            line_height: LineHeight::Absolute(50.),
+            ..root_style()
+        });
+        builder.pop_style_span();
+        builder.push_text_with_source("fice", 21);
+        let mut layout = Layout::default();
+        let (text, sources) = builder.build_into_with_sources(&mut layout);
+        layout.break_all_lines(None);
+        (layout, text, sources)
+    };
+
+    let (plain, plain_text, plain_sources) = build(false, &mut fcx, &mut lcx);
+    let (participants, participant_text, participant_sources) = build(true, &mut fcx, &mut lcx);
+    assert_eq!(participant_text, plain_text);
+    assert_eq!(participant_sources, plain_sources);
+    assert_eq!(
+        participants
+            .lines()
+            .next()
+            .unwrap()
+            .empty_spans()
+            .map(|(style, _)| style)
+            .collect::<alloc::vec::Vec<_>>(),
+        alloc::vec![1]
+    );
+
+    let signature = |layout: &Layout<ColorBrush>| {
+        layout
+            .lines()
+            .flat_map(|line| line.items())
+            .filter_map(|item| match item {
+                crate::PositionedLayoutItem::GlyphRun(run) => Some((
+                    run.style_index(),
+                    run.text_range(),
+                    run.offset(),
+                    run.advance(),
+                    run.positioned_glyphs()
+                        .map(|glyph| (glyph.id, glyph.x, glyph.y - run.baseline(), glyph.advance))
+                        .collect::<alloc::vec::Vec<_>>(),
+                )),
+                _ => None,
+            })
+            .collect::<alloc::vec::Vec<_>>()
+    };
+    assert_eq!(signature(&participants), signature(&plain));
+    // Participants may grow the line and move its baseline, but must not alter the shaped glyph
+    // sequence or its placement relative to that baseline.
+    assert!(
+        participants.lines().next().unwrap().metrics().line_height
+            > plain.lines().next().unwrap().metrics().line_height
+    );
+}
+
+#[test]
+fn empty_span_after_atomic_quota_stays_on_the_atomic_line() {
+    for trailing in [false, true] {
+        let mut fcx = create_font_context();
+        let mut lcx = LayoutContext::new();
+        let root = root_style();
+        let mut builder = lcx.tree_builder(&mut fcx, 1., false, &root);
+        builder.set_empty_span_participation(true);
+        builder.push_inline_box(InlineBox {
+            id: 91,
+            kind: InlineBoxKind::InFlow,
+            index: 0,
+            width: 11.,
+            height: 14.,
+            baseline: Some(11.),
+            vertical_align: VerticalAlign::BASELINE,
+        });
+        builder.push_style_span(TextStyle {
+            font_size: 32.,
+            ..root_style()
+        });
+        builder.pop_style_span();
+        if !trailing {
+            builder.push_text("X");
+        }
+        let (mut layout, _) = builder.build();
+        let mut breaker = layout.break_lines();
+        while breaker.break_next_with_length(1).is_some() {}
+        breaker.finish();
+        let first = layout.lines().next().unwrap();
+        let spans = first.empty_spans().collect::<alloc::vec::Vec<_>>();
+        assert_eq!(spans.len(), 1);
+        assert_close(spans[0].1, 11.);
+        assert!(
+            layout
+                .lines()
+                .skip(1)
+                .all(|line| line.empty_spans().next().is_none())
+        );
     }
 }

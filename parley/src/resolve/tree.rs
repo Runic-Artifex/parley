@@ -20,6 +20,18 @@ struct StyleTreeNode<B: Brush> {
     /// The style's id when it is used for whitespace that wrapping is allowed after, which differs
     /// from `style_id` only for spans that disable wrapping.
     wrappable_style_id: Option<u16>,
+    anchor: usize,
+    ordinary_span: bool,
+    has_content: bool,
+    boxes_before: usize,
+}
+
+/// An ordinary span erased from the normalized text, separate from shaping and provenance.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct EmptySpan {
+    pub(crate) index: usize,
+    pub(crate) style: u16,
+    pub(crate) boxes_before: usize,
 }
 
 /// A collapsible whitespace sequence that has not been committed yet.
@@ -48,6 +60,8 @@ pub(crate) struct TreeStyleBuilder<B: Brush> {
     uncommitted_text: String,
     uncommitted_sources: Vec<TextSourceRange>,
     sources: Vec<TextSourceRange>,
+    pending_anchors: Vec<usize>,
+    box_count: usize,
     current_span: usize,
     /// The span that a not-yet-committed collapsible whitespace sequence belongs to.
     ///
@@ -70,6 +84,8 @@ impl<B: Brush> Default for TreeStyleBuilder<B> {
             uncommitted_text: String::new(),
             uncommitted_sources: Vec::new(),
             sources: Vec::new(),
+            pending_anchors: Vec::new(),
+            box_count: 0,
             current_span: usize::MAX,
             pending_whitespace: None,
             last_item_is_inline_box: false,
@@ -94,6 +110,8 @@ impl<B: Brush> TreeStyleBuilder<B> {
         self.uncommitted_text.clear();
         self.uncommitted_sources.clear();
         self.sources.clear();
+        self.pending_anchors.clear();
+        self.box_count = 0;
         self.pending_whitespace = None;
         self.last_item_is_inline_box = false;
 
@@ -107,6 +125,10 @@ impl<B: Brush> TreeStyleBuilder<B> {
             style: root_style,
             style_id: Some(0),
             wrappable_style_id: None,
+            anchor: 0,
+            ordinary_span: false,
+            has_content: false,
+            boxes_before: 0,
         });
         self.current_span = 0;
     }
@@ -133,7 +155,7 @@ impl<B: Brush> TreeStyleBuilder<B> {
                     // Pending whitespace is always from a `WhiteSpaceCollapse::Collapse` or
                     // `WhiteSpaceCollapse::PreserveBreaks` span, and following CSS Text 4 § 4.3.1 Rule 1
                     // must be removed if it immediately precedes a preserved segment break.
-                    self.pending_whitespace = None;
+                    self.discard_pending_whitespace();
                 }
                 self.flush_pending_whitespace();
                 self.commit_text_with_sources(
@@ -178,7 +200,7 @@ impl<B: Brush> TreeStyleBuilder<B> {
                         // reach this point, so only `LS` and `PS` are treated as forced breaks. In
                         // `PreserveBreaks` mode `CR` and `LF` are not collapsible and are also
                         // preserved as forced breaks.
-                        self.pending_whitespace = None;
+                        self.discard_pending_whitespace();
                         let break_len = rest.chars().next().unwrap().len_utf8();
                         let start = uncommitted_text.len() - rest.len();
                         self.commit_text_with_sources(
@@ -219,8 +241,12 @@ impl<B: Brush> TreeStyleBuilder<B> {
         // or tab is retained, as only collapsible whitespace collapses.
         let is_at_start = self.text.is_empty() && !self.last_item_is_inline_box;
         if is_at_start || self.text.ends_with(is_segment_break) {
+            self.resolve_pending_anchors(false);
             return;
         }
+
+        self.resolve_pending_anchors(true);
+        self.mark_content(pending.span);
 
         let style_index = if pending.wrappable {
             self.resolve_wrappable_style_id(pending.span)
@@ -232,6 +258,18 @@ impl<B: Brush> TreeStyleBuilder<B> {
         if let Some(source) = pending.source {
             self.record_source(start..start + 1, source);
         }
+    }
+
+    fn resolve_pending_anchors(&mut self, retained: bool) {
+        for index in self.pending_anchors.drain(..) {
+            let span = &mut self.tree[index];
+            span.anchor += usize::from(retained);
+        }
+    }
+
+    fn discard_pending_whitespace(&mut self) {
+        self.pending_whitespace = None;
+        self.resolve_pending_anchors(false);
     }
 
     /// The style table index of the span that text is currently being pushed into.
@@ -247,6 +285,7 @@ impl<B: Brush> TreeStyleBuilder<B> {
         input: Range<usize>,
         sources: &[TextSourceRange],
     ) {
+        self.mark_content(span);
         let style_index = self.resolve_style_id(span);
         let output_start = self.text.len();
         self.commit_styled_text(style_index, text);
@@ -292,6 +331,27 @@ impl<B: Brush> TreeStyleBuilder<B> {
             }),
         }
         self.last_item_is_inline_box = false;
+    }
+
+    fn mark_content(&mut self, mut span: usize) {
+        loop {
+            if self.tree[span].has_content {
+                break;
+            }
+            self.tree[span].has_content = true;
+            let Some(parent) = self.tree[span].parent else {
+                break;
+            };
+            span = parent;
+        }
+    }
+
+    pub(crate) fn mark_current_span_content(&mut self) {
+        self.mark_content(self.current_span);
+    }
+
+    pub(crate) fn note_inline_box(&mut self) {
+        self.box_count += 1;
     }
 
     /// The index of `span`'s style in the style table, adding it (and any ancestors that have not
@@ -350,8 +410,15 @@ impl<B: Brush> TreeStyleBuilder<B> {
             style,
             style_id: None,
             wrappable_style_id: None,
+            anchor: self.text.len(),
+            ordinary_span: true,
+            has_content: false,
+            boxes_before: self.box_count,
         });
         self.current_span = self.tree.len() - 1;
+        if self.pending_whitespace.is_some() {
+            self.pending_anchors.push(self.current_span);
+        }
     }
 
     /// Begins a child span with the current style modified by the given properties.
@@ -364,6 +431,7 @@ impl<B: Brush> TreeStyleBuilder<B> {
             style.apply(prop);
         }
         self.push_style_span(style);
+        self.tree[self.current_span].ordinary_span = false;
     }
 
     /// Ends the current span, returning to its parent.
@@ -392,16 +460,50 @@ impl<B: Brush> TreeStyleBuilder<B> {
     }
 
     /// Computes style table + style runs and returns the final text buffer.
+    #[cfg(test)]
     pub(crate) fn finish(
         &mut self,
         style_table: &mut Vec<ResolvedStyle<B>>,
         style_runs: &mut Vec<StyleRun>,
+    ) -> String {
+        self.finish_with_empty(style_table, style_runs, &mut Vec::new(), false)
+    }
+
+    pub(crate) fn finish_with_empty(
+        &mut self,
+        style_table: &mut Vec<ResolvedStyle<B>>,
+        style_runs: &mut Vec<StyleRun>,
+        empty_spans: &mut Vec<EmptySpan>,
+        retain_empty: bool,
     ) -> String {
         while self.tree[self.current_span].parent.is_some() {
             self.pop_style_span();
         }
 
         self.commit_uncommitted_text();
+
+        // Trailing collapsed spaces are removed. Resolve their anchors before materialising
+        // empty spans; collecting candidates first keeps nested empty children independent.
+        self.discard_pending_whitespace();
+        empty_spans.clear();
+        if retain_empty {
+            let candidates: Vec<_> = self
+                .tree
+                .iter()
+                .enumerate()
+                .filter(|(_, span)| span.ordinary_span && !span.has_content)
+                .map(|(index, _)| index)
+                .collect();
+            for span in candidates {
+                let style = self.resolve_style_id(span);
+                empty_spans.push(EmptySpan {
+                    index: self.tree[span].anchor,
+                    style,
+                    boxes_before: self.tree[span].boxes_before,
+                });
+            }
+            empty_spans.sort_by_key(|span| span.index);
+        }
 
         style_table.clear();
         style_runs.clear();

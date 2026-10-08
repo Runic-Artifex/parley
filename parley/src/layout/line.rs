@@ -51,7 +51,8 @@ impl<'a, B: Brush> Line<'a, B> {
     ///
     /// These bounds use the ascent and descent of the style's first available font. They do not
     /// include line-height leading, fallback glyph overflow, or descendant inline content.
-    /// The coordinates are in the layout's coordinate space.
+    /// The coordinates are in the layout's coordinate space. An otherwise invisible empty line
+    /// has a collapsed content area at the span's shifted baseline.
     pub fn style_content_bounds(&self, style_index: usize) -> Option<(f32, f32)> {
         let style_index = u16::try_from(style_index).ok()?;
         let metrics = self
@@ -60,7 +61,21 @@ impl<'a, B: Brush> Line<'a, B> {
             .style_metrics
             .get(usize::from(style_index))?;
         let baseline = self.style_baseline(style_index);
+        if self.layout.data.text_len == 0
+            && self.data.metrics.line_height == 0.
+            && !self.data.empty_spans.is_empty()
+        {
+            return Some((baseline, baseline));
+        }
         Some((baseline - metrics.ascent, baseline + metrics.descent))
+    }
+
+    /// Ordinary empty spans participating on this line, as (style index, inline offset).
+    ///
+    /// Offsets use layout units and reflect bidi ordering and alignment. These participants
+    /// neither reserve advance nor add positioned glyph/atomic items or editor caret stops.
+    pub fn empty_spans(&self) -> impl Iterator<Item = (usize, f32)> + Clone + use<'a, B> {
+        super::empty_spans::positions(self.clone())
     }
 
     /// Returns the primary font's ascent and descent for this style span, in layout units.

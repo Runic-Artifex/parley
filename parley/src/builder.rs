@@ -243,6 +243,7 @@ pub struct TreeBuilder<'a, B: Brush> {
     pub(crate) options: BuilderOptions<'a>,
     pub(crate) lcx: &'a mut LayoutContext<B>,
     pub(crate) fcx: &'a mut FontContext,
+    pub(crate) retain_empty_spans: bool,
 }
 
 /// A normalized UTF-8 byte range attributed to an opaque caller-provided source.
@@ -259,6 +260,14 @@ pub struct TextSourceRange {
 }
 
 impl<'b, B: Brush> TreeBuilder<'b, B> {
+    /// Retains ordinary empty style spans as zero-advance line participants.
+    ///
+    /// Disabled by default. Modification scopes do not generate participants. Retained spans
+    /// share the layout's font metric policy and do not introduce text or shaping boundaries.
+    pub fn set_empty_span_participation(&mut self, enabled: bool) {
+        self.retain_empty_spans = enabled;
+    }
+
     pub fn push_style_span(&mut self, style: TextStyle<'_, '_, B>) {
         let resolved = self
             .lcx
@@ -307,6 +316,7 @@ impl<'b, B: Brush> TreeBuilder<'b, B> {
 
         if inline_box.kind == InlineBoxKind::InFlow {
             self.lcx.tree_style_builder.flush_pending_whitespace();
+            self.lcx.tree_style_builder.mark_current_span_content();
             self.lcx.tree_style_builder.set_last_item_is_inline_box();
         }
 
@@ -318,6 +328,7 @@ impl<'b, B: Brush> TreeBuilder<'b, B> {
             parent_style_index,
             baseline_offset: 0.,
         });
+        self.lcx.tree_style_builder.note_inline_box();
     }
 
     /// Sets the paragraph's base direction.
@@ -341,27 +352,35 @@ impl<'b, B: Brush> TreeBuilder<'b, B> {
 
     #[inline]
     pub fn build_into(self, layout: &mut Layout<B>) -> String {
+        let mut empty_spans = Vec::new();
         // Apply TreeStyleBuilder styles to LayoutContext.
-        let text = self
-            .lcx
-            .tree_style_builder
-            .finish(&mut self.lcx.style_table, &mut self.lcx.style_runs);
+        let text = self.lcx.tree_style_builder.finish_with_empty(
+            &mut self.lcx.style_table,
+            &mut self.lcx.style_runs,
+            &mut empty_spans,
+            self.retain_empty_spans,
+        );
         self.lcx.tree_style_builder.take_sources();
 
         // Call generic layout builder method
         build_into_layout(layout, &text, self.lcx, self.fcx, self.options);
+        layout.data.empty_spans = empty_spans;
 
         text
     }
 
     /// Builds a layout and returns text provenance in the normalized text's byte space.
     pub fn build_into_with_sources(self, layout: &mut Layout<B>) -> (String, Vec<TextSourceRange>) {
-        let text = self
-            .lcx
-            .tree_style_builder
-            .finish(&mut self.lcx.style_table, &mut self.lcx.style_runs);
+        let mut empty_spans = Vec::new();
+        let text = self.lcx.tree_style_builder.finish_with_empty(
+            &mut self.lcx.style_table,
+            &mut self.lcx.style_runs,
+            &mut empty_spans,
+            self.retain_empty_spans,
+        );
         let sources = self.lcx.tree_style_builder.take_sources();
         build_into_layout(layout, &text, self.lcx, self.fcx, self.options);
+        layout.data.empty_spans = empty_spans;
         (text, sources)
     }
 

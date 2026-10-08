@@ -81,6 +81,7 @@ pub enum BreakReason {
 
 #[derive(Clone, Default, Debug, PartialEq)]
 pub(crate) struct LineData {
+    pub(crate) empty_spans: Range<usize>,
     /// Range of the source text.
     pub(crate) text_range: Range<usize>,
     /// Range of line items.
@@ -205,6 +206,7 @@ pub(crate) struct LayoutItem {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct LayoutData<B: Brush> {
+    pub(crate) empty_spans: Vec<crate::resolve::tree::EmptySpan>,
     // General settings (directly from the "builder")
     /// The display scale factor
     pub(crate) scale: f32,
@@ -261,6 +263,7 @@ pub(crate) struct LayoutData<B: Brush> {
 impl<B: Brush> Default for LayoutData<B> {
     fn default() -> Self {
         Self {
+            empty_spans: Vec::new(),
             scale: 1.,
             quantize: true,
             quantization_mode: QuantizationMode::Device,
@@ -294,6 +297,7 @@ impl<B: Brush> LayoutData<B> {
     }
 
     pub(crate) fn clear(&mut self) {
+        self.empty_spans.clear();
         self.scale = 1.;
         self.quantize = true;
         self.quantization_mode = QuantizationMode::Device;

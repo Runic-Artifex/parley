@@ -10,6 +10,7 @@ pub(crate) mod flow;
 mod line;
 mod line_alignment;
 mod line_break;
+pub(crate) mod line_commit;
 mod quantization;
 mod run;
 mod spacing;

@@ -13,12 +13,12 @@ use parlance::BidiLevel;
 use crate::layout::Quantization;
 use crate::layout::data::{AlignedSubtreeOffset, StyleBaselineOffset, run_box_metrics};
 use crate::layout::line_alignment::{Extents, LineAlignment, SubtreeExtents};
+use crate::layout::line_commit::{append_line_items, legacy_commit_items, reorder_line_items};
 use crate::layout::spacing::{EffectiveSpacing, Justification, is_word_separator};
 use crate::layout::style_metrics::{InlineBoxPlacement, inline_box_placement};
 use crate::layout::whitespace::atom_hanging_advance;
 use crate::layout::{
-    BreakReason, Layout, LayoutData, LayoutItem, LayoutItemKind, LineData, LineItemData,
-    LineMetrics, Run,
+    BreakReason, Layout, LayoutData, LayoutItemKind, LineData, LineItemData, LineMetrics, Run,
 };
 use crate::style::Brush;
 use crate::{
@@ -1659,91 +1659,11 @@ fn commit_line<B: Brush>(
 
     let items_to_commit = &layout.data.items[state.items.clone()];
 
-    // Compute first and last run index
-    let is_text_run = |item: &LayoutItem| item.kind == LayoutItemKind::TextRun;
-    let first_run_pos = items_to_commit.iter().position(is_text_run).unwrap_or(0);
-    let last_run_pos = items_to_commit.iter().rposition(is_text_run).unwrap_or(0);
-
-    // Iterate over the items to commit
-    let mut last_item_kind = LayoutItemKind::TextRun;
-    let mut committed_text_run = false;
-    // The line's source text range, as the union of the ranges of the text runs committed to it.
-    let mut text_start = usize::MAX;
-    let mut text_end = 0;
-    // Mark line as needing bidi re-ordering if it contains any runs with non-zero bidi level
-    // (zero is the default level, so this is equivalent to marking lines that have multiple levels)
-    let mut needs_reorder = false;
-    for (i, item) in items_to_commit.iter().enumerate() {
-        match item.kind {
-            LayoutItemKind::InlineBox => {
-                lines.line_items.push(LineItemData {
-                    kind: LayoutItemKind::InlineBox,
-                    index: item.index,
-                    bidi_level: item.bidi_level,
-
-                    // These properties are ignored for inline boxes. So we just put a dummy value.
-                    shaped_cluster_range: 0..0,
-                    text_range: 0..0,
-                });
-
-                last_item_kind = item.kind;
-            }
-            LayoutItemKind::TextRun => {
-                let shaped_run = &shaped_text.runs()[item.index];
-
-                // Compute cluster range
-                // The first and last ranges have overrides to account for line-breaks within runs
-                let mut cluster_range = shaped_run.shaped_clusters_range.clone();
-                if i == first_run_pos {
-                    cluster_range.start = state.clusters.start;
-                }
-                if i == last_run_pos {
-                    cluster_range.end = state.clusters.end;
-                }
-
-                if cluster_range.start >= shaped_run.shaped_clusters_range.end {
-                    continue;
-                }
-
-                last_item_kind = item.kind;
-                committed_text_run = true;
-
-                // Map the cluster range to the source-text range. Line boundaries are always
-                // aligned to `Atom`s, i.e., line bounds are always grapheme bounds.
-                let slice = shaped_text.run_slice(item.index as u32);
-                let item_text_range = if cluster_range.is_empty() {
-                    let char_pos = shaped_clusters[cluster_range.start as usize]
-                        .chars_range()
-                        .start;
-                    let text_pos = slice.text_byte_at(char_pos);
-                    text_pos..text_pos
-                } else {
-                    let char_range = shaped_clusters[cluster_range.start as usize]
-                        .chars_range()
-                        .start
-                        ..shaped_clusters[cluster_range.end as usize - 1]
-                            .chars_range()
-                            .end;
-                    slice.text_byte_range(char_range)
-                };
-
-                // Compute the text range for the line
-                // Q: Can we not simplify this computation by assuming that items are in order?
-                text_start = text_start.min(item_text_range.start);
-                text_end = text_end.max(item_text_range.end);
-                needs_reorder |= shaped_run.bidi_level != BidiLevel::new(0);
-
-                lines.line_items.push(LineItemData {
-                    kind: LayoutItemKind::TextRun,
-                    index: item.index,
-                    bidi_level: shaped_run.bidi_level,
-                    shaped_cluster_range: cluster_range,
-                    text_range: item_text_range,
-                });
-            }
-        }
-    }
-    // let end_run_idx = lines.line_items.last().map(|item| item.index).unwrap_or(0);
+    let summary = append_line_items(
+        layout,
+        &mut lines.line_items,
+        legacy_commit_items(layout, items_to_commit, state.clusters.clone()),
+    );
     let end_item_idx = lines.line_items.len();
 
     // Trailing whitespace under `WhiteSpaceCollapse::Preserve` directly preceding a forced break
@@ -1770,14 +1690,14 @@ fn commit_line<B: Brush>(
 
     // Reorder the items within the line (if required). Reordering is required if the line contains
     // a mix of bidi levels (a mix of LTR and RTL text)
-    if needs_reorder && end_item_idx - start_item_idx > 1 {
+    if summary.needs_reorder && end_item_idx - start_item_idx > 1 {
         reorder_line_items(&mut lines.line_items[start_item_idx..end_item_idx]);
     }
 
     lines.lines.push(LineData {
         empty_spans: state.empty_spans.clone(),
         item_range: start_item_idx..end_item_idx,
-        text_range: text_start..text_end,
+        text_range: summary.text_range,
         max_advance,
         break_reason,
         num_justification_opportunities,
@@ -1796,11 +1716,11 @@ fn commit_line<B: Brush>(
     });
 
     // Reset state for the new line
-    if committed_text_run {
+    if summary.committed_text_run {
         state.clusters.start = state.clusters.end;
     }
 
-    state.items.start = match last_item_kind {
+    state.items.start = match summary.last_item_kind {
         // For text runs, the first item of line N+1 needs to be the SAME as
         // the last item for line N. This is because the item (if it a text run
         // may be split across the two lines with some clusters in line N and some
@@ -1938,45 +1858,4 @@ fn hanging_whitespace<B: Brush>(
         justification_end_cluster,
         hanging_opportunities,
     )
-}
-
-/// Reorder items within line according to the bidi levels of the items
-fn reorder_line_items(runs: &mut [LineItemData]) {
-    let run_count = runs.len();
-
-    // Find the max level and the min *odd* level
-    let mut max_level = 0;
-    let mut lowest_odd_level = 255;
-    for run in runs.iter() {
-        let level = run.bidi_level;
-        let is_odd = level.to_u8() & 1 != 0;
-
-        // Update max level
-        if level.to_u8() > max_level {
-            max_level = level.to_u8();
-        }
-
-        // Update min odd level
-        if is_odd && level.to_u8() < lowest_odd_level {
-            lowest_odd_level = level.to_u8();
-        }
-    }
-
-    // Iterate over bidi levels
-    for level in (lowest_odd_level..=max_level).rev() {
-        // Iterate over text runs
-        let mut i = 0;
-        while i < run_count {
-            if runs[i].bidi_level.to_u8() >= level {
-                let mut end = i + 1;
-                while end < run_count && runs[end].bidi_level.to_u8() >= level {
-                    end += 1;
-                }
-
-                runs[i..end].reverse();
-                i = end;
-            }
-            i += 1;
-        }
-    }
 }

@@ -68,6 +68,19 @@ pub(crate) enum SpanEdgeKind {
     Close,
 }
 
+/// Authored control order in normalized text, independent of shaped item order.
+///
+/// Box anchors retain normalization history that `InlineBox::index` loses when
+/// an out-of-flow box is pushed while a collapsible space is still pending.
+/// These sites are metadata, not used advances or positioned line items.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SpanControl {
+    /// Index in the immutable authored `span_edges` stream.
+    Edge(usize),
+    /// Global box identity and its normalized byte anchor.
+    InlineBox { index: usize, anchor: usize },
+}
+
 /// A collapsible whitespace sequence that has not been committed yet.
 #[derive(Debug, Clone, Copy)]
 struct PendingWhitespace {
@@ -83,6 +96,7 @@ struct PendingWhitespace {
 enum PendingAnchor {
     Open(usize),
     Close(usize),
+    Box(usize),
 }
 
 /// Whether `c` is a segment break, i.e. a character which is a forced line break when preserved.
@@ -104,6 +118,8 @@ pub(crate) struct TreeStyleBuilder<B: Brush> {
     boundary_spans: Vec<usize>,
     style_spans: Vec<StyleSpan>,
     span_edges: Vec<SpanEdge>,
+    span_controls: Vec<SpanControl>,
+    normalized_box_anchors: Vec<usize>,
     track_style_spans: bool,
     next_edge_order: usize,
     box_count: usize,
@@ -133,6 +149,8 @@ impl<B: Brush> Default for TreeStyleBuilder<B> {
             boundary_spans: Vec::new(),
             style_spans: Vec::new(),
             span_edges: Vec::new(),
+            span_controls: Vec::new(),
+            normalized_box_anchors: Vec::new(),
             track_style_spans: false,
             next_edge_order: 0,
             box_count: 0,
@@ -164,6 +182,8 @@ impl<B: Brush> TreeStyleBuilder<B> {
         self.boundary_spans.clear();
         self.style_spans.clear();
         self.span_edges.clear();
+        self.span_controls.clear();
+        self.normalized_box_anchors.clear();
         self.track_style_spans = false;
         self.next_edge_order = 0;
         self.box_count = 0;
@@ -326,6 +346,7 @@ impl<B: Brush> TreeStyleBuilder<B> {
             let target = match anchor {
                 PendingAnchor::Open(index) => &mut self.tree[index].anchor,
                 PendingAnchor::Close(index) => &mut self.tree[index].end_anchor,
+                PendingAnchor::Box(index) => &mut self.normalized_box_anchors[index],
             };
             *target += usize::from(retained);
         }
@@ -415,6 +436,11 @@ impl<B: Brush> TreeStyleBuilder<B> {
     }
 
     pub(crate) fn note_inline_box(&mut self) {
+        self.normalized_box_anchors.push(self.text.len());
+        if self.pending_whitespace.is_some() {
+            self.pending_anchors
+                .push(PendingAnchor::Box(self.box_count));
+        }
         self.box_count += 1;
     }
 
@@ -475,6 +501,10 @@ impl<B: Brush> TreeStyleBuilder<B> {
 
     pub(crate) fn take_span_edges(&mut self) -> Vec<SpanEdge> {
         core::mem::take(&mut self.span_edges)
+    }
+
+    pub(crate) fn take_span_controls(&mut self) -> Vec<SpanControl> {
+        core::mem::take(&mut self.span_controls)
     }
 
     /// Begins a child span with the given style, which subsequent text is attributed to.
@@ -634,6 +664,7 @@ impl<B: Brush> TreeStyleBuilder<B> {
 
         self.style_spans.clear();
         self.span_edges.clear();
+        self.span_controls.clear();
         if self.track_style_spans {
             let mut ordered_edges = Vec::new();
             let candidates: Vec<_> = self
@@ -674,6 +705,36 @@ impl<B: Brush> TreeStyleBuilder<B> {
             ordered_edges.sort_unstable_by_key(|(order, _)| *order);
             self.span_edges
                 .extend(ordered_edges.into_iter().map(|(_, edge)| edge));
+
+            // Merge two authored streams by global box ordinal, never by byte
+            // sorting. Equal-byte nested/sibling edges keep their exact order.
+            let mut next_box = 0;
+            let mut previous_anchor = 0;
+            for (ordinal, edge) in self.span_edges.iter().enumerate() {
+                while next_box < edge.boxes_before {
+                    let anchor = self.normalized_box_anchors[next_box];
+                    debug_assert!(anchor >= previous_anchor);
+                    self.span_controls.push(SpanControl::InlineBox {
+                        index: next_box,
+                        anchor,
+                    });
+                    previous_anchor = anchor;
+                    next_box += 1;
+                }
+                debug_assert!(edge.index >= previous_anchor);
+                self.span_controls.push(SpanControl::Edge(ordinal));
+                previous_anchor = edge.index;
+            }
+            while next_box < self.normalized_box_anchors.len() {
+                let anchor = self.normalized_box_anchors[next_box];
+                debug_assert!(anchor >= previous_anchor);
+                self.span_controls.push(SpanControl::InlineBox {
+                    index: next_box,
+                    anchor,
+                });
+                previous_anchor = anchor;
+                next_box += 1;
+            }
         }
 
         style_table.clear();

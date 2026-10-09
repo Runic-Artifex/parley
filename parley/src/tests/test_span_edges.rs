@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 
 use super::utils::ColorBrush;
 use super::utils::fonts::{FONT_FAMILY_LIST, create_font_context};
-use crate::resolve::tree::SpanEdgeKind;
+use crate::resolve::tree::{SpanControl, SpanEdgeKind};
 use crate::{
     Alignment, AlignmentOptions, FontContext, FontFamily, InlineBox, InlineBoxKind, Layout,
     LayoutContext, LineHeight, PositionedLayoutItem, StyleProperty, TextStyle, TreeBuilder,
@@ -57,6 +57,61 @@ fn owner(layout: &Layout<ColorBrush>, ordinal: usize) -> u16 {
     layout.data.style_spans[ordinal].style
 }
 
+// Replay the authored stream as an owner stack. Each box must occur exactly once,
+// and its owners must agree with the independently captured span box intervals.
+fn control_owners(layout: &Layout<ColorBrush>) -> Vec<(usize, Vec<u16>)> {
+    let mut stack = Vec::new();
+    let mut boxes = Vec::new();
+    let mut next_edge = 0;
+    let mut next_box = 0;
+    let mut previous_anchor = 0;
+    for control in &layout.data.span_controls {
+        let anchor = match *control {
+            SpanControl::Edge(index) => {
+                assert_eq!(index, next_edge, "edges retain authored order");
+                next_edge += 1;
+                let edge = &layout.data.span_edges[index];
+                assert_eq!(edge.boxes_before, next_box);
+                match edge.kind {
+                    SpanEdgeKind::Open => stack.push(edge.style),
+                    SpanEdgeKind::Close => assert_eq!(stack.pop(), Some(edge.style)),
+                }
+                edge.index
+            }
+            SpanControl::InlineBox { index, anchor } => {
+                assert_eq!(index, next_box, "boxes retain global ordinals");
+                next_box += 1;
+                let owners = layout
+                    .data
+                    .style_spans
+                    .iter()
+                    .filter(|span| span.boxes_before <= index && index < span.boxes_after)
+                    .map(|span| span.style)
+                    .collect::<Vec<_>>();
+                assert_eq!(stack, owners, "box {index} has its authored owners");
+                boxes.push((index, stack.clone()));
+                anchor
+            }
+        };
+        assert!(
+            anchor >= previous_anchor,
+            "normalized anchors must be monotonic"
+        );
+        previous_anchor = anchor;
+    }
+    assert!(
+        stack.is_empty(),
+        "ordinary owners must close in stack order"
+    );
+    assert_eq!(next_edge, layout.data.span_edges.len());
+    assert_eq!(next_box, layout.inline_boxes().count());
+    boxes
+}
+
+fn box_control(index: usize, anchor: usize) -> SpanControl {
+    SpanControl::InlineBox { index, anchor }
+}
+
 fn inline_box(id: u64, kind: InlineBoxKind) -> InlineBox {
     InlineBox {
         id,
@@ -104,6 +159,16 @@ fn equal_position_nested_and_sibling_edges_retain_authored_order() {
             ]
         };
         assert_eq!(events(&layout), expected);
+        assert_eq!(
+            layout.data.span_controls,
+            alloc::vec![
+                SpanControl::Edge(0),
+                SpanControl::Edge(1),
+                SpanControl::Edge(2),
+                SpanControl::Edge(3)
+            ]
+        );
+        assert!(control_owners(&layout).is_empty());
         assert!(layout.data.empty_spans.is_empty());
     }
 }
@@ -203,6 +268,30 @@ fn coincident_edges_keep_ordinals_for_all_box_kinds_and_nested_spans() {
         ]
     );
     assert_eq!(layout.inline_boxes().count(), 4);
+    assert_eq!(
+        layout.data.span_controls,
+        alloc::vec![
+            box_control(0, 0),
+            SpanControl::Edge(0),
+            box_control(1, 0),
+            SpanControl::Edge(1),
+            box_control(2, 0),
+            SpanControl::Edge(2),
+            box_control(3, 0),
+            SpanControl::Edge(3),
+            SpanControl::Edge(4),
+            SpanControl::Edge(5),
+        ]
+    );
+    assert_eq!(
+        control_owners(&layout),
+        alloc::vec![
+            (0, alloc::vec![]),
+            (1, alloc::vec![a]),
+            (2, alloc::vec![a, b]),
+            (3, alloc::vec![a]),
+        ]
+    );
 }
 
 #[test]
@@ -224,7 +313,159 @@ fn pending_whitespace_can_move_span_endpoints_past_an_authored_out_of_flow_box()
             alloc::vec![(2, s, 0, true), (2, s, 1, false)]
         );
         assert_eq!(layout.inline_boxes().next().unwrap().index, 1);
+        assert_eq!(
+            layout.data.span_controls,
+            alloc::vec![
+                SpanControl::Edge(0),
+                box_control(0, 2),
+                SpanControl::Edge(1)
+            ]
+        );
+        assert_eq!(control_owners(&layout), alloc::vec![(0, alloc::vec![s])]);
     }
+}
+
+#[test]
+fn normalized_box_sites_distinguish_whitespace_sides_and_utf8_boundaries() {
+    let mut fcx = create_font_context();
+    let mut lcx = LayoutContext::new();
+    for kind in [InlineBoxKind::OutOfFlow, InlineBoxKind::CustomOutOfFlow] {
+        // Prefix and suffix lie outside the empty owner. Public box positions
+        // intentionally retain their older pre-normalization values.
+        for (prefix, suffix, mode, expected_text, public_index, anchor) in [
+            ("a ", "b", WhiteSpaceCollapse::Collapse, "a b", 1, 2),
+            ("a", " b", WhiteSpaceCollapse::Collapse, "a b", 1, 1),
+            (" ", "b", WhiteSpaceCollapse::Collapse, "b", 0, 0),
+            ("a ", "", WhiteSpaceCollapse::Collapse, "a", 1, 1),
+            (
+                "a ",
+                "\nb",
+                WhiteSpaceCollapse::PreserveBreaks,
+                "a\nb",
+                1,
+                1,
+            ),
+            (
+                "a ",
+                "\u{2028}b",
+                WhiteSpaceCollapse::Collapse,
+                "a\u{2028}b",
+                1,
+                1,
+            ),
+            ("\n ", "b", WhiteSpaceCollapse::PreserveBreaks, "\nb", 1, 1),
+            ("é ", "🙂", WhiteSpaceCollapse::Collapse, "é 🙂", 2, 3),
+            ("é", " 🙂", WhiteSpaceCollapse::Collapse, "é 🙂", 2, 2),
+        ] {
+            let mut root = style();
+            root.white_space_collapse = mode;
+            let mut b = lcx.tree_builder(&mut fcx, 1., false, &root);
+            b.set_style_span_tracking(true);
+            b.push_text(prefix);
+            b.push_style_span(root.clone());
+            b.push_inline_box(inline_box(0, kind));
+            b.pop_style_span();
+            b.push_text(suffix);
+            let (layout, text) = b.build();
+            assert_eq!(text, expected_text, "{prefix:?}, {suffix:?}, {kind:?}");
+            assert_eq!(layout.inline_boxes().next().unwrap().index, public_index);
+            let s = owner(&layout, 0);
+            assert_eq!(
+                events(&layout),
+                alloc::vec![(anchor, s, 0, true), (anchor, s, 1, false)]
+            );
+            assert_eq!(
+                layout.data.span_controls,
+                alloc::vec![
+                    SpanControl::Edge(0),
+                    box_control(0, anchor),
+                    SpanControl::Edge(1)
+                ]
+            );
+            assert!(text.is_char_boundary(anchor));
+            assert_eq!(control_owners(&layout), alloc::vec![(0, alloc::vec![s])]);
+        }
+    }
+    // An in-flow box itself retains the pending space, even with no later text.
+    for suffix in ["", "b"] {
+        let (layout, text) = build(&mut fcx, &mut lcx, |b| {
+            b.push_text("a ");
+            b.push_style_span(style());
+            b.push_inline_box(inline_box(0, InlineBoxKind::InFlow));
+            b.pop_style_span();
+            b.push_text(suffix);
+        });
+        assert_eq!(text, if suffix.is_empty() { "a " } else { "a b" });
+        assert_eq!(layout.inline_boxes().next().unwrap().index, 2);
+        assert_eq!(
+            layout.data.span_controls,
+            alloc::vec![
+                SpanControl::Edge(0),
+                box_control(0, 2),
+                SpanControl::Edge(1)
+            ]
+        );
+        assert_eq!(
+            control_owners(&layout),
+            alloc::vec![(0, alloc::vec![owner(&layout, 0)])]
+        );
+    }
+}
+
+#[test]
+fn pending_box_sites_keep_nested_and_sibling_owners_when_in_flow_resolves_space() {
+    let mut fcx = create_font_context();
+    let mut lcx = LayoutContext::new();
+    let (layout, text) = build(&mut fcx, &mut lcx, |b| {
+        b.push_text("é ");
+        b.push_inline_box(inline_box(0, InlineBoxKind::OutOfFlow));
+        b.push_style_span(style());
+        b.push_inline_box(inline_box(1, InlineBoxKind::OutOfFlow));
+        b.push_style_span(style());
+        b.push_inline_box(inline_box(2, InlineBoxKind::CustomOutOfFlow));
+        b.pop_style_span();
+        b.push_style_span(style());
+        b.push_inline_box(inline_box(3, InlineBoxKind::CustomOutOfFlow));
+        b.pop_style_span();
+        b.pop_style_span();
+        b.push_inline_box(inline_box(4, InlineBoxKind::CustomOutOfFlow));
+        b.push_inline_box(inline_box(5, InlineBoxKind::InFlow));
+        b.push_text("🙂");
+    });
+    assert_eq!(text, "é 🙂");
+    assert_eq!(
+        layout.inline_boxes().map(|b| b.index).collect::<Vec<_>>(),
+        alloc::vec![2, 2, 2, 2, 2, 3]
+    );
+    assert_eq!(
+        layout.data.span_controls,
+        alloc::vec![
+            box_control(0, 3),
+            SpanControl::Edge(0),
+            box_control(1, 3),
+            SpanControl::Edge(1),
+            box_control(2, 3),
+            SpanControl::Edge(2),
+            SpanControl::Edge(3),
+            box_control(3, 3),
+            SpanControl::Edge(4),
+            SpanControl::Edge(5),
+            box_control(4, 3),
+            box_control(5, 3),
+        ]
+    );
+    let (a, b, c) = (owner(&layout, 0), owner(&layout, 1), owner(&layout, 2));
+    assert_eq!(
+        control_owners(&layout),
+        alloc::vec![
+            (0, alloc::vec![]),
+            (1, alloc::vec![a]),
+            (2, alloc::vec![a, b]),
+            (3, alloc::vec![a, c]),
+            (4, alloc::vec![]),
+            (5, alloc::vec![]),
+        ]
+    );
 }
 
 #[test]
@@ -243,7 +484,8 @@ fn automatic_closing_preserves_the_explicit_authored_edge_sequence() {
                 b.pop_style_span();
             }
         });
-        outputs.push((text, events(&layout)));
+        control_owners(&layout);
+        outputs.push((text, events(&layout), layout.data.span_controls.clone()));
     }
     assert_eq!(outputs[0], outputs[1]);
     assert_eq!(outputs[0].0, "a b");
@@ -259,17 +501,22 @@ fn final_tracking_switch_controls_the_complete_authored_history() {
     let mut lcx = LayoutContext::new();
     for final_enabled in [false, true] {
         let mut b = lcx.tree_builder(&mut fcx, 1., false, &style());
+        b.push_inline_box(inline_box(0, InlineBoxKind::OutOfFlow));
         b.push_style_span(style());
         b.push_text("a");
+        b.push_inline_box(inline_box(1, InlineBoxKind::CustomOutOfFlow));
         b.pop_style_span();
         b.set_style_span_tracking(true);
         b.push_style_span(style());
         b.push_text("b");
+        b.push_inline_box(inline_box(2, InlineBoxKind::InFlow));
         b.pop_style_span();
         b.set_style_span_tracking(false);
         b.push_style_span(style());
+        b.push_inline_box(inline_box(3, InlineBoxKind::OutOfFlow));
         b.push_text("c");
         b.pop_style_span();
+        b.push_inline_box(inline_box(4, InlineBoxKind::OutOfFlow));
         b.set_style_span_tracking(final_enabled);
         let (layout, text) = b.build();
         assert_eq!(text, "abc");
@@ -278,16 +525,43 @@ fn final_tracking_switch_controls_the_complete_authored_history() {
             assert_eq!(
                 events(&layout),
                 alloc::vec![
-                    (0, a, 0, true),
-                    (1, a, 0, false),
-                    (1, b, 0, true),
-                    (2, b, 0, false),
-                    (2, c, 0, true),
-                    (3, c, 0, false)
+                    (0, a, 1, true),
+                    (1, a, 2, false),
+                    (1, b, 2, true),
+                    (2, b, 3, false),
+                    (2, c, 3, true),
+                    (3, c, 4, false)
+                ]
+            );
+            assert_eq!(
+                layout.data.span_controls,
+                alloc::vec![
+                    box_control(0, 0),
+                    SpanControl::Edge(0),
+                    box_control(1, 1),
+                    SpanControl::Edge(1),
+                    SpanControl::Edge(2),
+                    box_control(2, 2),
+                    SpanControl::Edge(3),
+                    SpanControl::Edge(4),
+                    box_control(3, 2),
+                    SpanControl::Edge(5),
+                    box_control(4, 3),
+                ]
+            );
+            assert_eq!(
+                control_owners(&layout),
+                alloc::vec![
+                    (0, alloc::vec![]),
+                    (1, alloc::vec![a]),
+                    (2, alloc::vec![b]),
+                    (3, alloc::vec![c]),
+                    (4, alloc::vec![]),
                 ]
             );
         } else {
             assert!(layout.data.span_edges.is_empty());
+            assert!(layout.data.span_controls.is_empty());
         }
     }
 }
@@ -304,38 +578,54 @@ fn reused_context_ranged_builders_and_layout_clear_remove_previous_edges() {
         }
         b.push_style_span(style());
         b.push_text("a");
+        b.push_inline_box(inline_box(0, InlineBoxKind::OutOfFlow));
         b.pop_style_span();
         b.build_into(&mut layout);
         assert_eq!(layout.data.span_edges.len(), if tracked { 2 } else { 0 });
+        assert_eq!(layout.data.span_controls.len(), if tracked { 3 } else { 0 });
+        if tracked {
+            control_owners(&layout);
+        }
     }
     let mut ranged = lcx.ranged_builder(&mut fcx, "a", 1., false);
     ranged.push_default(StyleProperty::FontSize(20.));
     ranged.build_into(&mut layout, "a");
     assert!(layout.data.span_edges.is_empty());
+    assert!(layout.data.span_controls.is_empty());
     layout = build(&mut fcx, &mut lcx, |b| {
         b.push_style_span(style());
         b.push_text("a");
+        b.push_inline_box(inline_box(0, InlineBoxKind::OutOfFlow));
     })
     .0;
     layout.clear();
     assert!(layout.data.span_edges.is_empty());
+    assert!(layout.data.span_controls.is_empty());
     {
         let mut abandoned = lcx.tree_builder(&mut fcx, 1., false, &style());
         abandoned.set_style_span_tracking(true);
         abandoned.push_style_span(style());
         abandoned.push_text("stale");
+        abandoned.push_inline_box(inline_box(0, InlineBoxKind::OutOfFlow));
     }
     let b = lcx.tree_builder(&mut fcx, 1., false, &style());
     b.build_into(&mut layout);
     assert!(layout.data.span_edges.is_empty());
+    assert!(layout.data.span_controls.is_empty());
+    let (empty, text) = build(&mut fcx, &mut lcx, |_| {});
+    assert!(text.is_empty());
+    assert!(empty.data.span_edges.is_empty());
+    assert!(empty.data.span_controls.is_empty());
 }
 
 fn paragraph(fcx: &mut FontContext, lcx: &mut LayoutContext<ColorBrush>) -> Layout<ColorBrush> {
     build(fcx, lcx, |b| {
         b.push_style_span(style());
         b.push_text("aa bb ");
+        b.push_inline_box(inline_box(0, InlineBoxKind::OutOfFlow));
         b.push_style_span(style());
         b.push_text("cc dd");
+        b.push_inline_box(inline_box(1, InlineBoxKind::InFlow));
         b.pop_style_span();
         b.push_text(" ee");
         b.pop_style_span();
@@ -349,11 +639,26 @@ fn clone_rewrap_both_breakers_and_checkpoint_replay_keep_edges_immutable() {
     let mut lcx = LayoutContext::new();
     let original = paragraph(&mut fcx, &mut lcx);
     let edges = events(&original);
+    let controls = original.data.span_controls.clone();
+    assert_eq!(
+        controls,
+        alloc::vec![
+            SpanControl::Edge(0),
+            box_control(0, 6),
+            SpanControl::Edge(1),
+            box_control(1, 11),
+            SpanControl::Edge(2),
+            SpanControl::Edge(3),
+        ]
+    );
+    let owners = control_owners(&original);
     let mut reused = original.clone();
     for width in [30., 70., 30.] {
         reused.break_all_lines(Some(width));
         reused.align(Alignment::Justify, AlignmentOptions::default());
         assert_eq!(events(&reused), edges);
+        assert_eq!(reused.data.span_controls, controls);
+        assert_eq!(control_owners(&reused), owners);
     }
     for quota in [false, true] {
         let mut sequential = original.clone();
@@ -385,10 +690,15 @@ fn clone_rewrap_both_breakers_and_checkpoint_replay_keep_edges_immutable() {
         }
         assert_eq!(events(&sequential), edges);
         assert_eq!(events(&replay), edges);
+        assert_eq!(sequential.data.span_controls, controls);
+        assert_eq!(replay.data.span_controls, controls);
+        assert_eq!(control_owners(&sequential), owners);
+        assert_eq!(control_owners(&replay), owners);
         assert_eq!(sequential.data.lines, replay.data.lines);
         assert_eq!(sequential.data.line_items, replay.data.line_items);
     }
     assert_eq!(events(&original), edges);
+    assert_eq!(original.data.span_controls, controls);
 }
 
 #[derive(Debug, PartialEq)]
@@ -444,9 +754,26 @@ fn captured_edges_add_no_sources_styles_shapes_metrics_or_public_positioned_item
         let mut layout = Layout::default();
         let (text, sources) = b.build_into_with_sources(&mut layout);
         assert_eq!(layout.data.span_edges.len(), if tracked { 4 } else { 0 });
+        assert_eq!(layout.data.span_controls.len(), if tracked { 6 } else { 0 });
+        if tracked {
+            assert_eq!(
+                layout.data.span_controls,
+                alloc::vec![
+                    SpanControl::Edge(0),
+                    SpanControl::Edge(1),
+                    box_control(0, 5),
+                    box_control(1, 5),
+                    SpanControl::Edge(2),
+                    SpanControl::Edge(3),
+                ]
+            );
+            control_owners(&layout);
+        }
+        let controls = layout.data.span_controls.clone();
         layout.break_all_lines(Some(60.));
         layout.align(Alignment::Justify, AlignmentOptions::default());
         let widths = layout.calculate_content_widths();
+        assert_eq!(layout.data.span_controls, controls);
         outputs.push((
             (
                 text,

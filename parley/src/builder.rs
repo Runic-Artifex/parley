@@ -412,6 +412,7 @@ impl<'b, B: Brush> TreeBuilder<'b, B> {
         layout.data.empty_spans = empty_spans;
         layout.data.style_spans = self.lcx.tree_style_builder.take_style_spans();
         layout.data.span_edges = self.lcx.tree_style_builder.take_span_edges();
+        layout.data.span_controls = self.lcx.tree_style_builder.take_span_controls();
 
         text
     }
@@ -443,6 +444,7 @@ impl<'b, B: Brush> TreeBuilder<'b, B> {
         layout.data.empty_spans = empty_spans;
         layout.data.style_spans = self.lcx.tree_style_builder.take_style_spans();
         layout.data.span_edges = self.lcx.tree_style_builder.take_span_edges();
+        layout.data.span_controls = self.lcx.tree_style_builder.take_span_controls();
         (text, sources)
     }
 

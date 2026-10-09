@@ -29,6 +29,8 @@ struct StyleTreeNode<B: Brush> {
     has_content: bool,
     boxes_before: usize,
     boxes_after: usize,
+    open_order: usize,
+    close_order: usize,
 }
 
 /// An ordinary span erased from the normalized text, separate from shaping and provenance.
@@ -46,6 +48,24 @@ pub(crate) struct StyleSpan {
     pub(crate) style: u16,
     pub(crate) boxes_before: usize,
     pub(crate) boxes_after: usize,
+}
+
+/// An authored ordinary-span edge, after whitespace normalization.
+///
+/// Edge order and box ordinals are independent of the UTF-8 position. In particular,
+/// coincident empty spans cannot be reconstructed by sorting or pairing endpoints.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SpanEdge {
+    pub(crate) index: usize,
+    pub(crate) style: u16,
+    pub(crate) boxes_before: usize,
+    pub(crate) kind: SpanEdgeKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SpanEdgeKind {
+    Open,
+    Close,
 }
 
 /// A collapsible whitespace sequence that has not been committed yet.
@@ -83,7 +103,9 @@ pub(crate) struct TreeStyleBuilder<B: Brush> {
     pending_anchors: Vec<PendingAnchor>,
     boundary_spans: Vec<usize>,
     style_spans: Vec<StyleSpan>,
+    span_edges: Vec<SpanEdge>,
     track_style_spans: bool,
+    next_edge_order: usize,
     box_count: usize,
     current_span: usize,
     /// The span that a not-yet-committed collapsible whitespace sequence belongs to.
@@ -110,7 +132,9 @@ impl<B: Brush> Default for TreeStyleBuilder<B> {
             pending_anchors: Vec::new(),
             boundary_spans: Vec::new(),
             style_spans: Vec::new(),
+            span_edges: Vec::new(),
             track_style_spans: false,
+            next_edge_order: 0,
             box_count: 0,
             current_span: usize::MAX,
             pending_whitespace: None,
@@ -139,7 +163,9 @@ impl<B: Brush> TreeStyleBuilder<B> {
         self.pending_anchors.clear();
         self.boundary_spans.clear();
         self.style_spans.clear();
+        self.span_edges.clear();
         self.track_style_spans = false;
+        self.next_edge_order = 0;
         self.box_count = 0;
         self.pending_whitespace = None;
         self.last_item_is_inline_box = false;
@@ -162,6 +188,8 @@ impl<B: Brush> TreeStyleBuilder<B> {
             has_content: false,
             boxes_before: 0,
             boxes_after: 0,
+            open_order: usize::MAX,
+            close_order: usize::MAX,
         });
         self.current_span = 0;
     }
@@ -445,6 +473,10 @@ impl<B: Brush> TreeStyleBuilder<B> {
         core::mem::take(&mut self.style_spans)
     }
 
+    pub(crate) fn take_span_edges(&mut self) -> Vec<SpanEdge> {
+        core::mem::take(&mut self.span_edges)
+    }
+
     /// Begins a child span with the given style, which subsequent text is attributed to.
     pub(crate) fn push_style_span(&mut self, style: ResolvedStyle<B>) {
         self.push_style_span_with_shaping_boundaries(style, false, false);
@@ -458,6 +490,8 @@ impl<B: Brush> TreeStyleBuilder<B> {
     ) {
         self.commit_uncommitted_text();
 
+        let open_order = self.next_edge_order;
+        self.next_edge_order += 1;
         self.tree.push(StyleTreeNode {
             parent: Some(self.current_span),
             style,
@@ -471,6 +505,8 @@ impl<B: Brush> TreeStyleBuilder<B> {
             has_content: false,
             boxes_before: self.box_count,
             boxes_after: self.box_count,
+            open_order,
+            close_order: usize::MAX,
         });
         self.current_span = self.tree.len() - 1;
         if self.pending_whitespace.is_some() {
@@ -501,6 +537,8 @@ impl<B: Brush> TreeStyleBuilder<B> {
 
         self.tree[self.current_span].end_anchor = self.text.len();
         self.tree[self.current_span].boxes_after = self.box_count;
+        self.tree[self.current_span].close_order = self.next_edge_order;
+        self.next_edge_order += 1;
         // Ownership follows whitespace already pending at closing, independently of whether
         // this edge requests shaping isolation. Later sibling whitespace must not move it.
         if self.tree[self.current_span].ordinary_span && self.pending_whitespace.is_some() {
@@ -595,7 +633,9 @@ impl<B: Brush> TreeStyleBuilder<B> {
         }
 
         self.style_spans.clear();
+        self.span_edges.clear();
         if self.track_style_spans {
+            let mut ordered_edges = Vec::new();
             let candidates: Vec<_> = self
                 .tree
                 .iter()
@@ -612,7 +652,28 @@ impl<B: Brush> TreeStyleBuilder<B> {
                     boxes_before: span.boxes_before,
                     boxes_after: span.boxes_after,
                 });
+                ordered_edges.push((
+                    span.open_order,
+                    SpanEdge {
+                        index: span.anchor,
+                        style,
+                        boxes_before: span.boxes_before,
+                        kind: SpanEdgeKind::Open,
+                    },
+                ));
+                ordered_edges.push((
+                    span.close_order,
+                    SpanEdge {
+                        index: span.end_anchor,
+                        style,
+                        boxes_before: span.boxes_after,
+                        kind: SpanEdgeKind::Close,
+                    },
+                ));
             }
+            ordered_edges.sort_unstable_by_key(|(order, _)| *order);
+            self.span_edges
+                .extend(ordered_edges.into_iter().map(|(_, edge)| edge));
         }
 
         style_table.clear();

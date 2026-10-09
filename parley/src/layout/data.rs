@@ -208,6 +208,8 @@ pub(crate) struct LayoutItem {
 pub(crate) struct LayoutData<B: Brush> {
     pub(crate) empty_spans: Vec<crate::resolve::tree::EmptySpan>,
     pub(crate) style_spans: Vec<crate::resolve::tree::StyleSpan>,
+    /// Immutable authored edge order; no advances or line items are introduced by tracking.
+    pub(crate) span_edges: Vec<crate::resolve::tree::SpanEdge>,
     // General settings (directly from the "builder")
     /// The display scale factor
     pub(crate) scale: f32,
@@ -266,6 +268,7 @@ impl<B: Brush> Default for LayoutData<B> {
         Self {
             empty_spans: Vec::new(),
             style_spans: Vec::new(),
+            span_edges: Vec::new(),
             scale: 1.,
             quantize: true,
             quantization_mode: QuantizationMode::Device,
@@ -301,6 +304,7 @@ impl<B: Brush> LayoutData<B> {
     pub(crate) fn clear(&mut self) {
         self.empty_spans.clear();
         self.style_spans.clear();
+        self.span_edges.clear();
         self.scale = 1.;
         self.quantize = true;
         self.quantization_mode = QuantizationMode::Device;

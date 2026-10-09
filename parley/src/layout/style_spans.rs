@@ -3,7 +3,8 @@
 
 //! Read-only ownership bounds for ordinary spans, separate from shaping and metrics.
 
-use super::line::{AtomIter, Line, LineItem};
+use super::flow::{ContentFlow, ContentItem};
+use super::line::Line;
 use super::whitespace::whitespace_hangs;
 use crate::{InlineBoxKind, WhiteSpaceCollapse, style::Brush};
 use parley_engine::Atom;
@@ -31,60 +32,46 @@ pub(super) fn bounds<B: Brush>(line: Line<'_, B>, style_index: usize) -> Option<
     } else {
         (start, start + metrics.advance - metrics.hanging_advance)
     };
-    let mut x = start;
-    for item_index in 0..line.len() {
-        match line.item(item_index)? {
-            LineItem::Run(run) => {
-                let mut atoms = AtomIter::new(run);
-                while let Some(atom) = atoms.peek() {
-                    let (glyph_count, measured_advance) = atoms.measure(&atom);
-                    // Positioned glyph traversal ignores glyphless atoms. Keep their anchor,
-                    // including a preserved newline's zero-width position, without adding a gap.
-                    let advance = if glyph_count == 0 {
-                        0.
+    for item in ContentFlow::new(line.clone()) {
+        match item {
+            ContentItem::Atom(item) => {
+                let run = item.run;
+                let atom = item.atom;
+                let x = item.x;
+                let advance = item.advance;
+                let chars = atom.characters();
+                let first = chars.first()?.text_byte_start as usize;
+                let end = chars.last()?.text_byte_range().end;
+                let (collapsed, all_collapse) = collapsed_suffix(run, &atom);
+                let (mut left, mut right) = (x, x + advance);
+                if all_collapse {
+                    left = left.max(visible_min).min(visible_max);
+                    right = right.max(visible_min).min(visible_max);
+                } else if collapsed > 0. {
+                    // Trim only the collapsing suffix. A preserved child or a non-whitespace
+                    // prefix within the same atom still owns its full positioned extent.
+                    if run.is_rtl() {
+                        left = left.max(visible_min).min(x + collapsed);
                     } else {
-                        measured_advance
-                    };
-                    let chars = atom.characters();
-                    let first = chars.first()?.text_byte_start as usize;
-                    let end = chars.last()?.text_byte_range().end;
-                    let (collapsed, all_collapse) = collapsed_suffix(run, &atom);
-                    let (mut left, mut right) = (x, x + advance);
-                    if all_collapse {
-                        left = left.max(visible_min).min(visible_max);
-                        right = right.max(visible_min).min(visible_max);
-                    } else if collapsed > 0. {
-                        // Trim only the collapsing suffix. A preserved child or a non-whitespace
-                        // prefix within the same atom still owns its full positioned extent.
-                        if run.is_rtl() {
-                            left = left.max(visible_min).min(x + collapsed);
-                        } else {
-                            right = right.min(visible_max).max(x + advance - collapsed);
-                        }
+                        right = right.min(visible_max).max(x + advance - collapsed);
                     }
-                    if span.range.contains(&first) {
-                        include(left, right);
-                    } else if !span.range.is_empty()
-                        && span.range.start < end
-                        && first < span.range.end
-                    {
-                        // Continuation-only ownership has no caret fraction: the atom belongs
-                        // in full to its first code unit's owner, and this span follows its end.
-                        let end = if run.is_rtl() { left } else { right };
-                        include(end, end);
-                    }
-                    x += advance;
-                    atoms.consume();
+                }
+                if span.range.contains(&first) {
+                    include(left, right);
+                } else if !span.range.is_empty() && span.range.start < end && first < span.range.end
+                {
+                    // Continuation-only ownership has no caret fraction: the atom belongs
+                    // in full to its first code unit's owner, and this span follows its end.
+                    let end = if run.is_rtl() { left } else { right };
+                    include(end, end);
                 }
             }
-            LineItem::InlineBox(inline_box) => {
+            ContentItem::InlineBox(item) => {
+                let inline_box = item.inline_box;
                 if inline_box.kind == InlineBoxKind::InFlow {
-                    let box_index =
-                        line.layout.data.line_items[line.data.item_range.start + item_index].index;
-                    if (span.boxes_before..span.boxes_after).contains(&box_index) {
-                        include(x, x + inline_box.width);
+                    if (span.boxes_before..span.boxes_after).contains(&item.box_index) {
+                        include(item.x, item.x + item.advance);
                     }
-                    x += inline_box.width;
                 }
             }
         }

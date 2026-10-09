@@ -6,7 +6,7 @@
 mod alignment;
 mod cluster;
 mod empty_spans;
-mod style_spans;
+pub(crate) mod flow;
 mod line;
 mod line_alignment;
 mod line_break;
@@ -14,6 +14,7 @@ mod quantization;
 mod run;
 mod spacing;
 pub(crate) mod style_metrics;
+mod style_spans;
 mod whitespace;
 
 // TODO - Add to allowed lint set?

@@ -3,8 +3,9 @@
 
 //! Visual positioning of zero-advance spans, separate from shaping and caret items.
 
-use super::line::{Line, LineItem};
-use crate::{InlineBoxKind, style::Brush};
+use super::flow::BoxFlow;
+use super::line::Line;
+use crate::style::Brush;
 
 pub(super) fn positions<'a, B: Brush>(
     line: Line<'a, B>,
@@ -52,31 +53,15 @@ pub(super) fn positions<'a, B: Brush>(
             // Text byte positions alone cannot distinguish empty siblings on either side of
             // contiguous atomic boxes. Retain their tree order and use the owning line's visual
             // item order; out-of-flow boxes have no reserved advance.
-            let mut x = line.data.metrics.inline_min_coord + line.data.metrics.offset;
             let mut preceding_box = None;
             let mut following_box = None;
-            for (index, item) in line.layout.data.line_items[line.data.item_range.clone()]
-                .iter()
-                .enumerate()
-            {
-                match line.item(index) {
-                    Some(LineItem::Run(run)) => x += run.advance(),
-                    Some(LineItem::InlineBox(inline_box)) => {
-                        let width = if inline_box.kind == InlineBoxKind::InFlow {
-                            inline_box.width
-                        } else {
-                            0.
-                        };
-                        if inline_box.index == span.index {
-                            if item.index + 1 == span.boxes_before {
-                                preceding_box = Some(x + if item.is_rtl() { 0. } else { width });
-                            } else if item.index == span.boxes_before {
-                                following_box = Some(x + if item.is_rtl() { width } else { 0. });
-                            }
-                        }
-                        x += width;
+            for item in BoxFlow::new(line.clone()) {
+                if item.inline_box.index == span.index {
+                    if item.box_index + 1 == span.boxes_before {
+                        preceding_box = Some(item.x + if item.is_rtl { 0. } else { item.advance });
+                    } else if item.box_index == span.boxes_before {
+                        following_box = Some(item.x + if item.is_rtl { item.advance } else { 0. });
                     }
-                    None => {}
                 }
             }
             if let Some(x) = preceding_box.or(following_box) {

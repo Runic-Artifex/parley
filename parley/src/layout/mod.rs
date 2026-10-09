@@ -6,6 +6,7 @@
 mod alignment;
 mod cluster;
 mod empty_spans;
+mod style_spans;
 mod line;
 mod line_alignment;
 mod line_break;

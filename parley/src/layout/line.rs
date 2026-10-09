@@ -78,6 +78,18 @@ impl<'a, B: Brush> Line<'a, B> {
         super::empty_spans::positions(self.clone())
     }
 
+    /// Horizontal union of a tracked ordinary span's content on this line, in layout units.
+    ///
+    /// Whole shaping atoms belong to the span containing their first code unit. A span beginning
+    /// inside an atom can have a real zero-width bound at the atom's logical end, rather than a
+    /// caret fraction. Descendant text and in-flow atomic boxes are included; no external margins
+    /// or decoration advances are added. Bounds reflect alignment, justification and normalized
+    /// whitespace policy. Returns `None` for an untracked style or absent line participation.
+    /// Empty spans require the builder's independent empty-span participation option.
+    pub fn style_span_bounds(&self, style_index: usize) -> Option<(f32, f32)> {
+        super::style_spans::bounds(self.clone(), style_index)
+    }
+
     /// Returns the primary font's ascent and descent for this style span, in layout units.
     ///
     /// These retain the layout's metric quantization policy and exclude line-height leading,
@@ -425,7 +437,7 @@ impl<'a, B: Brush> GlyphRun<'a, B> {
 /// [`Cluster`](crate::Cluster)s and their composed glyph iterators. It computes the same glyph
 /// counts and advances as [`Run::glyphs_in`] over the same atoms.
 #[derive(Clone)]
-struct AtomIter<'a> {
+pub(super) struct AtomIter<'a> {
     atoms: Atoms<'a>,
     spacing: EffectiveSpacing,
     is_rtl: bool,
@@ -434,7 +446,7 @@ struct AtomIter<'a> {
 }
 
 impl<'a> AtomIter<'a> {
-    fn new<B: Brush>(run: Run<'a, B>) -> Self {
+    pub(super) fn new<B: Brush>(run: Run<'a, B>) -> Self {
         let slice = run.line_slice();
         let is_rtl = run.is_rtl();
         Self {
@@ -450,7 +462,7 @@ impl<'a> AtomIter<'a> {
     }
 
     #[inline]
-    fn peek(&mut self) -> Option<Atom<'a>> {
+    pub(super) fn peek(&mut self) -> Option<Atom<'a>> {
         if self.peeked.is_none() {
             self.peeked = if self.is_rtl {
                 self.atoms.prev()
@@ -463,14 +475,14 @@ impl<'a> AtomIter<'a> {
 
     /// Consume the atom returned by [`Self::peek`], so the next peek moves on.
     #[inline]
-    fn consume(&mut self) {
+    pub(super) fn consume(&mut self) {
         self.peeked = None;
     }
 
     /// The number of glyphs in `atom` and the sum of their advances (including spacing gaps),
     /// matching what [`Run::glyphs_in`] yields for the atom's clusters.
     #[inline]
-    fn measure(&self, atom: &Atom<'a>) -> (usize, f32) {
+    pub(super) fn measure(&self, atom: &Atom<'a>) -> (usize, f32) {
         let glyph_count: usize = atom
             .shaped_clusters()
             .iter()

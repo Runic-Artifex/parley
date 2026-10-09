@@ -272,6 +272,16 @@ impl<'b, B: Brush> TreeBuilder<'b, B> {
         self.retain_empty_spans = enabled;
     }
 
+    /// Tracks ordinary span ownership through whitespace normalization.
+    ///
+    /// Disabled by default on each new builder. Tracked ranges and atomic-box ordinals let
+    /// [`crate::Line::style_span_bounds`] report whole-atom ownership without changing text,
+    /// shaping, advances or source ranges. Modification scopes are transparent. Empty-span
+    /// geometry still requires [`Self::set_empty_span_participation`].
+    pub fn set_style_span_tracking(&mut self, enabled: bool) {
+        self.lcx.tree_style_builder.set_style_span_tracking(enabled);
+    }
+
     pub fn push_style_span(&mut self, style: TextStyle<'_, '_, B>) {
         self.push_style_span_with_shaping_boundaries(style, false, false);
     }
@@ -400,6 +410,7 @@ impl<'b, B: Brush> TreeBuilder<'b, B> {
             &shaping_boundaries,
         );
         layout.data.empty_spans = empty_spans;
+        layout.data.style_spans = self.lcx.tree_style_builder.take_style_spans();
 
         text
     }
@@ -429,6 +440,7 @@ impl<'b, B: Brush> TreeBuilder<'b, B> {
             &shaping_boundaries,
         );
         layout.data.empty_spans = empty_spans;
+        layout.data.style_spans = self.lcx.tree_style_builder.take_style_spans();
         (text, sources)
     }
 

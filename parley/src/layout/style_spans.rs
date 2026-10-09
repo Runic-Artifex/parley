@@ -1,0 +1,140 @@
+// Copyright 2026 the Parley Authors
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+
+//! Read-only ownership bounds for ordinary spans, separate from shaping and metrics.
+
+use super::line::{AtomIter, Line, LineItem};
+use super::whitespace::whitespace_hangs;
+use crate::{InlineBoxKind, WhiteSpaceCollapse, style::Brush};
+use parley_engine::Atom;
+
+pub(super) fn bounds<B: Brush>(line: Line<'_, B>, style_index: usize) -> Option<(f32, f32)> {
+    let style = u16::try_from(style_index).ok()?;
+    let span = line
+        .layout
+        .data
+        .style_spans
+        .iter()
+        .find(|span| span.style == style)?;
+    let mut bounds: Option<(f32, f32)> = None;
+    let mut include = |start: f32, end: f32| {
+        let min = start.min(end);
+        let max = start.max(end);
+        bounds = Some(bounds.map_or((min, max), |(old_min, old_max)| {
+            (old_min.min(min), old_max.max(max))
+        }));
+    };
+    let metrics = line.metrics();
+    let start = metrics.inline_min_coord + metrics.offset;
+    let (visible_min, visible_max) = if line.layout.is_rtl() {
+        (start + metrics.hanging_advance, start + metrics.advance)
+    } else {
+        (start, start + metrics.advance - metrics.hanging_advance)
+    };
+    let mut x = start;
+    for item_index in 0..line.len() {
+        match line.item(item_index)? {
+            LineItem::Run(run) => {
+                let mut atoms = AtomIter::new(run);
+                while let Some(atom) = atoms.peek() {
+                    let (glyph_count, measured_advance) = atoms.measure(&atom);
+                    // Positioned glyph traversal ignores glyphless atoms. Keep their anchor,
+                    // including a preserved newline's zero-width position, without adding a gap.
+                    let advance = if glyph_count == 0 {
+                        0.
+                    } else {
+                        measured_advance
+                    };
+                    let chars = atom.characters();
+                    let first = chars.first()?.text_byte_start as usize;
+                    let end = chars.last()?.text_byte_range().end;
+                    let (collapsed, all_collapse) = collapsed_suffix(run, &atom);
+                    let (mut left, mut right) = (x, x + advance);
+                    if all_collapse {
+                        left = left.max(visible_min).min(visible_max);
+                        right = right.max(visible_min).min(visible_max);
+                    } else if collapsed > 0. {
+                        // Trim only the collapsing suffix. A preserved child or a non-whitespace
+                        // prefix within the same atom still owns its full positioned extent.
+                        if run.is_rtl() {
+                            left = left.max(visible_min).min(x + collapsed);
+                        } else {
+                            right = right.min(visible_max).max(x + advance - collapsed);
+                        }
+                    }
+                    if span.range.contains(&first) {
+                        include(left, right);
+                    } else if !span.range.is_empty()
+                        && span.range.start < end
+                        && first < span.range.end
+                    {
+                        // Continuation-only ownership has no caret fraction: the atom belongs
+                        // in full to its first code unit's owner, and this span follows its end.
+                        let end = if run.is_rtl() { left } else { right };
+                        include(end, end);
+                    }
+                    x += advance;
+                    atoms.consume();
+                }
+            }
+            LineItem::InlineBox(inline_box) => {
+                if inline_box.kind == InlineBoxKind::InFlow {
+                    let box_index =
+                        line.layout.data.line_items[line.data.item_range.start + item_index].index;
+                    if (span.boxes_before..span.boxes_after).contains(&box_index) {
+                        include(x, x + inline_box.width);
+                    }
+                    x += inline_box.width;
+                }
+            }
+        }
+    }
+    bounds.or_else(|| {
+        line.empty_spans()
+            .find(|(index, _)| *index == style_index)
+            .map(|(_, x)| (x, x))
+    })
+}
+
+/// Like whitespace hanging, but only a suffix processed by a collapsing policy can be
+/// trimmed from ownership. Preserved descendants keep their extent even under a collapsing
+/// ancestor; mixed-policy clusters are retained rather than clipping preserved characters.
+fn collapsed_suffix<B: Brush>(run: super::run::Run<'_, B>, atom: &Atom<'_>) -> (f32, bool) {
+    let slice = run.line_slice();
+    let styles = &run.layout.data.styles;
+    let mut advance = 0.;
+    let mut all_collapse = true;
+    for cluster in atom.shaped_clusters().iter().rev() {
+        let collapses = slice
+            .characters_in(cluster.chars_range())
+            .iter()
+            .all(|character| {
+                let style = &styles[character.style_index as usize];
+                matches!(
+                    style.white_space_collapse,
+                    WhiteSpaceCollapse::Collapse | WhiteSpaceCollapse::PreserveBreaks
+                ) && whitespace_hangs(character.whitespace, style)
+            });
+        if !collapses {
+            all_collapse = false;
+            break;
+        }
+        advance += cluster.advance;
+    }
+    let gaps = run.line_spacing().gaps(atom);
+    if advance != 0. || all_collapse {
+        advance += if run.is_rtl() {
+            gaps.before
+        } else {
+            gaps.after
+        };
+    }
+    if all_collapse {
+        advance += if run.is_rtl() {
+            gaps.after
+        } else {
+            gaps.before
+        };
+    }
+    (advance, all_collapse)
+}

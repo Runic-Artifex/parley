@@ -207,6 +207,7 @@ pub(crate) struct LayoutItem {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct LayoutData<B: Brush> {
     pub(crate) empty_spans: Vec<crate::resolve::tree::EmptySpan>,
+    pub(crate) style_spans: Vec<crate::resolve::tree::StyleSpan>,
     // General settings (directly from the "builder")
     /// The display scale factor
     pub(crate) scale: f32,
@@ -264,6 +265,7 @@ impl<B: Brush> Default for LayoutData<B> {
     fn default() -> Self {
         Self {
             empty_spans: Vec::new(),
+            style_spans: Vec::new(),
             scale: 1.,
             quantize: true,
             quantization_mode: QuantizationMode::Device,
@@ -298,6 +300,7 @@ impl<B: Brush> LayoutData<B> {
 
     pub(crate) fn clear(&mut self) {
         self.empty_spans.clear();
+        self.style_spans.clear();
         self.scale = 1.;
         self.quantize = true;
         self.quantization_mode = QuantizationMode::Device;

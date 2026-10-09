@@ -28,6 +28,7 @@ struct StyleTreeNode<B: Brush> {
     ordinary_span: bool,
     has_content: bool,
     boxes_before: usize,
+    boxes_after: usize,
 }
 
 /// An ordinary span erased from the normalized text, separate from shaping and provenance.
@@ -36,6 +37,15 @@ pub(crate) struct EmptySpan {
     pub(crate) index: usize,
     pub(crate) style: u16,
     pub(crate) boxes_before: usize,
+}
+
+/// Normalized ordinary-span ownership, independent of shaping and source metadata.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct StyleSpan {
+    pub(crate) range: Range<usize>,
+    pub(crate) style: u16,
+    pub(crate) boxes_before: usize,
+    pub(crate) boxes_after: usize,
 }
 
 /// A collapsible whitespace sequence that has not been committed yet.
@@ -72,6 +82,8 @@ pub(crate) struct TreeStyleBuilder<B: Brush> {
     sources: Vec<TextSourceRange>,
     pending_anchors: Vec<PendingAnchor>,
     boundary_spans: Vec<usize>,
+    style_spans: Vec<StyleSpan>,
+    track_style_spans: bool,
     box_count: usize,
     current_span: usize,
     /// The span that a not-yet-committed collapsible whitespace sequence belongs to.
@@ -97,6 +109,8 @@ impl<B: Brush> Default for TreeStyleBuilder<B> {
             sources: Vec::new(),
             pending_anchors: Vec::new(),
             boundary_spans: Vec::new(),
+            style_spans: Vec::new(),
+            track_style_spans: false,
             box_count: 0,
             current_span: usize::MAX,
             pending_whitespace: None,
@@ -124,6 +138,8 @@ impl<B: Brush> TreeStyleBuilder<B> {
         self.sources.clear();
         self.pending_anchors.clear();
         self.boundary_spans.clear();
+        self.style_spans.clear();
+        self.track_style_spans = false;
         self.box_count = 0;
         self.pending_whitespace = None;
         self.last_item_is_inline_box = false;
@@ -145,6 +161,7 @@ impl<B: Brush> TreeStyleBuilder<B> {
             ordinary_span: false,
             has_content: false,
             boxes_before: 0,
+            boxes_after: 0,
         });
         self.current_span = 0;
     }
@@ -420,6 +437,14 @@ impl<B: Brush> TreeStyleBuilder<B> {
         self.text.len()
     }
 
+    pub(crate) fn set_style_span_tracking(&mut self, enabled: bool) {
+        self.track_style_spans = enabled;
+    }
+
+    pub(crate) fn take_style_spans(&mut self) -> Vec<StyleSpan> {
+        core::mem::take(&mut self.style_spans)
+    }
+
     /// Begins a child span with the given style, which subsequent text is attributed to.
     pub(crate) fn push_style_span(&mut self, style: ResolvedStyle<B>) {
         self.push_style_span_with_shaping_boundaries(style, false, false);
@@ -445,6 +470,7 @@ impl<B: Brush> TreeStyleBuilder<B> {
             ordinary_span: true,
             has_content: false,
             boxes_before: self.box_count,
+            boxes_after: self.box_count,
         });
         self.current_span = self.tree.len() - 1;
         if self.pending_whitespace.is_some() {
@@ -474,7 +500,10 @@ impl<B: Brush> TreeStyleBuilder<B> {
         self.commit_uncommitted_text();
 
         self.tree[self.current_span].end_anchor = self.text.len();
-        if self.tree[self.current_span].boundary_after && self.pending_whitespace.is_some() {
+        self.tree[self.current_span].boxes_after = self.box_count;
+        // Ownership follows whitespace already pending at closing, independently of whether
+        // this edge requests shaping isolation. Later sibling whitespace must not move it.
+        if self.tree[self.current_span].ordinary_span && self.pending_whitespace.is_some() {
             self.pending_anchors
                 .push(PendingAnchor::Close(self.current_span));
         }
@@ -565,6 +594,27 @@ impl<B: Brush> TreeStyleBuilder<B> {
             empty_spans.sort_by_key(|span| span.index);
         }
 
+        self.style_spans.clear();
+        if self.track_style_spans {
+            let candidates: Vec<_> = self
+                .tree
+                .iter()
+                .enumerate()
+                .filter(|(_, span)| span.ordinary_span)
+                .map(|(index, _)| index)
+                .collect();
+            for span in candidates {
+                let style = self.resolve_style_id(span);
+                let span = &self.tree[span];
+                self.style_spans.push(StyleSpan {
+                    range: span.anchor..span.end_anchor,
+                    style,
+                    boxes_before: span.boxes_before,
+                    boxes_after: span.boxes_after,
+                });
+            }
+        }
+
         style_table.clear();
         style_runs.clear();
         style_table.extend_from_slice(&self.style_table);
@@ -587,6 +637,123 @@ mod tests {
     use super::*;
     use alloc::vec::Vec;
     use core::ops::Range;
+
+    #[test]
+    fn tracked_ownership_closes_follow_only_already_pending_whitespace() {
+        for (prefix, inner, suffix, expected, range) in [
+            ("f", "i ", "z", "fi z", 1..3),
+            ("f", "i", " z", "fi z", 1..2),
+            ("f ", "", "i", "f i", 2..2),
+            ("f", "", " i", "f i", 1..1),
+            (" ", "", "i", "i", 0..0),
+            ("f", " ", "", "f", 1..1),
+            ("é ", "i ", "z", "é i z", 3..5),
+            ("f", "i ", "\nz", "fi z", 1..3),
+        ] {
+            let style = ResolvedStyle {
+                white_space_collapse: WhiteSpaceCollapse::Collapse,
+                ..ResolvedStyle::default()
+            };
+            let mut builder = TreeStyleBuilder::<()>::default();
+            builder.begin(style.clone());
+            builder.set_style_span_tracking(true);
+            builder.push_text(prefix);
+            builder.push_style_span(style);
+            builder.push_text(inner);
+            builder.pop_style_span();
+            builder.push_text(suffix);
+            let text = builder.finish(&mut Vec::new(), &mut Vec::new());
+            let spans = builder.take_style_spans();
+            assert_eq!(text, expected);
+            assert_eq!(spans.len(), 1);
+            assert_eq!(spans[0].range, range, "{prefix:?}/{inner:?}/{suffix:?}");
+        }
+    }
+
+    #[test]
+    fn tracked_ownership_can_be_enabled_after_closing_and_resets_on_begin() {
+        let style = ResolvedStyle {
+            white_space_collapse: WhiteSpaceCollapse::Collapse,
+            ..ResolvedStyle::default()
+        };
+        let mut builder = TreeStyleBuilder::<()>::default();
+        builder.begin(style.clone());
+        builder.push_text("f");
+        builder.push_style_span(style.clone());
+        builder.push_text("i ");
+        builder.pop_style_span();
+        builder.push_text("z");
+        builder.set_style_span_tracking(true);
+        assert_eq!(builder.finish(&mut Vec::new(), &mut Vec::new()), "fi z");
+        assert_eq!(builder.take_style_spans()[0].range, 1..3);
+        builder.begin(style.clone());
+        builder.push_style_span(style);
+        builder.push_text("x");
+        builder.pop_style_span();
+        assert_eq!(builder.finish(&mut Vec::new(), &mut Vec::new()), "x");
+        assert!(builder.take_style_spans().is_empty());
+    }
+
+    #[test]
+    fn tracked_ownership_auto_closes_and_keeps_modification_scopes_transparent() {
+        let style = ResolvedStyle {
+            white_space_collapse: WhiteSpaceCollapse::Collapse,
+            ..ResolvedStyle::default()
+        };
+        let mut builder = TreeStyleBuilder::<()>::default();
+        builder.begin(style.clone());
+        builder.set_style_span_tracking(true);
+        builder.push_text("é");
+        builder.push_style_span(style);
+        builder.push_text("f");
+        builder.push_style_modification_span(core::iter::empty());
+        builder.push_text("i ");
+        assert_eq!(builder.finish(&mut Vec::new(), &mut Vec::new()), "éfi");
+        let spans = builder.take_style_spans();
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].range, 2..4);
+    }
+
+    #[test]
+    fn tracked_ownership_keeps_both_atomic_ordinals_at_equal_text_positions() {
+        let style = ResolvedStyle::default();
+        let mut builder = TreeStyleBuilder::<()>::default();
+        builder.begin(style.clone());
+        builder.set_style_span_tracking(true);
+        builder.note_inline_box();
+        builder.push_style_span(style.clone());
+        builder.note_inline_box();
+        builder.push_style_span(style);
+        builder.note_inline_box();
+        builder.pop_style_span();
+        builder.note_inline_box();
+        builder.pop_style_span();
+        builder.finish(&mut Vec::new(), &mut Vec::new());
+        let spans = builder.take_style_spans();
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].range, 0..0);
+        assert_eq!((spans[0].boxes_before, spans[0].boxes_after), (1, 4));
+        assert_eq!(spans[1].range, 0..0);
+        assert_eq!((spans[1].boxes_before, spans[1].boxes_after), (2, 3));
+    }
+
+    #[test]
+    fn tracked_closing_range_drops_pending_space_before_preserved_newline() {
+        let style = ResolvedStyle {
+            white_space_collapse: WhiteSpaceCollapse::PreserveBreaks,
+            ..ResolvedStyle::default()
+        };
+        let mut builder = TreeStyleBuilder::<()>::default();
+        builder.begin(style.clone());
+        builder.set_style_span_tracking(true);
+        builder.push_text("f");
+        builder.push_style_span(style);
+        builder.push_text("i ");
+        builder.pop_style_span();
+        builder.push_text("\nz");
+        assert_eq!(builder.finish(&mut Vec::new(), &mut Vec::new()), "fi\nz");
+        assert_eq!(builder.take_style_spans()[0].range, 1..2);
+    }
 
     #[test]
     fn shaping_edges_follow_only_whitespace_pending_at_capture() {

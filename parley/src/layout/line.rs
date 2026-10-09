@@ -225,12 +225,7 @@ impl<'a, B: Brush> Line<'a, B> {
     pub fn items(
         &self,
     ) -> impl Iterator<Item = PositionedLayoutItem<'a, B>> + 'a + Clone + use<'a, B> {
-        GlyphRunIter {
-            line: self.clone(),
-            item_index: 0,
-            atoms: None,
-            offset: 0.,
-        }
+        crate::layout::flow::LineFlow::new(self.clone()).glyph_runs()
     }
 }
 
@@ -357,15 +352,15 @@ pub struct PositionedInlineBox {
 /// Sequence of fully positioned glyphs with the same style.
 #[derive(Clone)]
 pub struct GlyphRun<'a, B: Brush> {
-    run: Run<'a, B>,
-    style_index: u16,
+    pub(super) run: Run<'a, B>,
+    pub(super) style_index: u16,
     /// The glyph run's shaped clusters, indexing into the shaped run this [`Run`] belongs to.
     ///
     /// Both bounds are atom boundaries, as glyph runs must span full ligatures.
-    shaped_clusters: Range<u32>,
-    offset: f32,
-    baseline: f32,
-    advance: f32,
+    pub(super) shaped_clusters: Range<u32>,
+    pub(super) offset: f32,
+    pub(super) baseline: f32,
+    pub(super) advance: f32,
 }
 
 impl<'a, B: Brush> GlyphRun<'a, B> {
@@ -431,7 +426,7 @@ impl<'a, B: Brush> GlyphRun<'a, B> {
 }
 
 /// Peekable iterator over the atoms of a run in visual order, resumable across
-/// [`GlyphRunIter::next`] calls.
+/// glyph traversal calls.
 ///
 /// This walks the run's shaped data ([`Atom`]s) directly rather than materialising
 /// [`Cluster`](crate::Cluster)s and their composed glyph iterators. It computes the same glyph
@@ -493,111 +488,5 @@ impl<'a> AtomIter<'a> {
             advance += self.spacing.gaps(atom).total();
         }
         (glyph_count, advance)
-    }
-}
-
-#[derive(Clone)]
-struct GlyphRunIter<'a, B: Brush> {
-    line: Line<'a, B>,
-    item_index: usize,
-    /// Iterator over the visual atoms of the run at `item_index`, positioned at the first atom
-    /// not yet yielded as part of a glyph run. `None` before entering a run.
-    atoms: Option<AtomIter<'a>>,
-    offset: f32,
-}
-
-impl<'a, B: Brush> Iterator for GlyphRunIter<'a, B> {
-    type Item = PositionedLayoutItem<'a, B>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let item = self.line.item(self.item_index)?;
-            match item {
-                LineItem::InlineBox(inline_box) => {
-                    let x = self.offset
-                        + self.line.data.metrics.inline_min_coord
-                        + self.line.data.metrics.offset;
-                    let box_index = self.line.layout.data.line_items
-                        [self.line.data.item_range.start + self.item_index]
-                        .index;
-                    let y = self.line.inline_box_top(box_index);
-
-                    self.item_index += 1;
-                    if inline_box.kind == InlineBoxKind::InFlow {
-                        self.offset += inline_box.width;
-                    }
-                    return Some(PositionedLayoutItem::InlineBox(PositionedInlineBox {
-                        x,
-                        y,
-                        width: inline_box.width,
-                        height: inline_box.height,
-                        baseline: inline_box.baseline,
-                        id: inline_box.id,
-                        kind: inline_box.kind,
-                    }));
-                }
-                LineItem::Run(run) => {
-                    // TODO: style indices are taken from the atom's first character, matching
-                    // `Cluster::style_index`. We could get the style index from `parley_engine`'s
-                    // `ShapedCluster` instead, which would be somewhat finer-grained.
-                    let atoms = self.atoms.get_or_insert_with(|| AtomIter::new(run));
-
-                    // Styles are uniform within an atom, so glyph runs always end on atom
-                    // boundaries and the iterator only needs to resume at atom granularity.
-                    // Atoms without glyphs don't take part.
-                    let mut advance = 0.0;
-                    let mut glyph_count = 0;
-                    // The style index and shaped cluster range of the glyph run being accumulated.
-                    let mut glyph_run: Option<(u16, Range<u32>)> = None;
-                    while let Some(atom) = atoms.peek() {
-                        let (atom_glyph_count, atom_advance) = atoms.measure(&atom);
-                        if atom_glyph_count != 0 {
-                            let atom_style_index = atom.characters()[0].style_index;
-                            let atom_clusters = atom.shaped_clusters_range();
-                            match &mut glyph_run {
-                                Some((style_index, shaped_clusters)) => {
-                                    if *style_index != atom_style_index {
-                                        break;
-                                    }
-                                    // In case the run is RTL, atoms are visited in reverse logical
-                                    // order, so just grow both sides of the range.
-                                    shaped_clusters.start =
-                                        shaped_clusters.start.min(atom_clusters.start);
-                                    shaped_clusters.end =
-                                        shaped_clusters.end.max(atom_clusters.end);
-                                }
-                                None => glyph_run = Some((atom_style_index, atom_clusters)),
-                            }
-                            glyph_count += atom_glyph_count;
-                            advance += atom_advance;
-                        }
-                        atoms.consume();
-                    }
-
-                    if let Some((style_index, shaped_clusters)) = glyph_run {
-                        debug_assert_eq!(
-                            run.glyphs_in(shaped_clusters.clone()).count(),
-                            glyph_count,
-                            "The calculated shaped cluster range of this glyph run must hold exactly the number of glyphs we counted above."
-                        );
-                        let offset = self.offset;
-                        self.offset += advance;
-                        return Some(PositionedLayoutItem::GlyphRun(GlyphRun {
-                            run,
-                            style_index,
-                            shaped_clusters,
-                            offset: offset
-                                + self.line.data.metrics.inline_min_coord
-                                + self.line.data.metrics.offset,
-                            baseline: self.line.style_baseline(style_index),
-                            advance,
-                        }));
-                    }
-                    // Any atoms left have no glyphs and thus nothing to yield.
-                    self.atoms = None;
-                    self.item_index += 1;
-                }
-            }
-        }
     }
 }

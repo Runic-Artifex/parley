@@ -3,10 +3,59 @@
 
 //! Borrowed visual traversal with each consumer's existing accumulation policy.
 
+mod cluster;
+mod glyph;
+mod selection;
+
+use super::cluster::{Cluster, ClusterSide};
 use super::line::{AtomIter, Line, LineItem};
 use super::run::Run;
 use crate::{InlineBox, InlineBoxKind, style::Brush};
+use core::ops::Range;
 use parley_engine::Atom;
+
+/// Borrowed entry point for horizontal traversals of a committed line.
+///
+/// The views deliberately retain each consumer's accumulation and box policy.
+/// Centralizing their entry point does not make their coordinates interchangeable.
+#[derive(Clone)]
+pub(crate) struct LineFlow<'a, B: Brush> {
+    line: Line<'a, B>,
+}
+
+impl<'a, B: Brush> LineFlow<'a, B> {
+    pub(crate) fn new(line: Line<'a, B>) -> Self {
+        Self { line }
+    }
+
+    pub(crate) fn glyph_runs(self) -> glyph::GlyphFlow<'a, B> {
+        glyph::GlyphFlow::new(self.line)
+    }
+
+    pub(crate) fn content(self) -> ContentFlow<'a, B> {
+        ContentFlow::new(self.line)
+    }
+
+    pub(crate) fn boxes(self) -> BoxFlow<'a, B> {
+        BoxFlow::new(self.line)
+    }
+
+    pub(crate) fn cluster_at(self, x: f32, exact: bool) -> Option<(Cluster<'a, B>, ClusterSide)> {
+        cluster::from_point(self.line, x, exact)
+    }
+
+    pub(crate) fn cluster_offset(self, cluster: &Cluster<'a, B>) -> Option<f32> {
+        cluster::visual_offset(self.line, *cluster)
+    }
+
+    pub(crate) fn selection_segments(
+        self,
+        text_range: &Range<usize>,
+        visit: impl FnMut(f64, f64),
+    ) -> selection::SelectionEnd {
+        selection::segments(self.line, text_range, visit)
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct FlowAtom<'a, B: Brush> {

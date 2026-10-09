@@ -3,7 +3,8 @@
 
 use crate::BoundingBox;
 use crate::editing::Cursor;
-use crate::layout::{Affinity, BreakReason, Cluster, Layout, LineItem};
+use crate::layout::flow::LineFlow;
+use crate::layout::{Affinity, BreakReason, Cluster, Layout};
 use crate::style::Brush;
 
 use alloc::vec::Vec;
@@ -561,47 +562,18 @@ impl Selection {
             if line_ix == line_start_ix || line_ix == line_end_ix {
                 // We only need to run the expensive logic on the first and
                 // last lines
-                let mut start_x = metrics.offset as f64 + metrics.inline_min_coord as f64;
-                let mut cur_x = start_x;
-                let mut cluster_count = 0;
-                let mut box_advance = 0.0;
-                let mut have_seen_any_runs = false;
-                for item in line.items_nonpositioned() {
-                    match item {
-                        LineItem::Run(run) => {
-                            have_seen_any_runs = true;
-                            for cluster in run.visual_clusters() {
-                                let advance = cluster.advance() as f64 + box_advance;
-                                box_advance = 0.0;
-                                if text_range.contains(&cluster.text_range().start) {
-                                    cluster_count += 1;
-                                    cur_x += advance;
-                                } else {
-                                    if cur_x != start_x {
-                                        f(
-                                            BoundingBox::new(start_x, line_min, cur_x, line_max),
-                                            line_ix,
-                                        );
-                                    }
-                                    cur_x += advance;
-                                    start_x = cur_x;
-                                }
-                            }
-                        }
-                        LineItem::InlineBox(inline_box) => {
-                            box_advance += inline_box.width as f64;
-                            // HACK: Don't display selections for inline boxes
-                            // if they're the first thing in the line. This
-                            // makes the selection match the cursor position.
-                            if !have_seen_any_runs {
-                                cur_x += box_advance;
-                                box_advance = 0.0;
-                                start_x = cur_x;
-                            }
-                        }
-                    }
-                }
-                let mut end_x = cur_x;
+                let segment_end = LineFlow::new(line.clone()).selection_segments(
+                    &text_range,
+                    |start_x, end_x| {
+                        f(
+                            BoundingBox::new(start_x, line_min, end_x, line_max),
+                            line_ix,
+                        );
+                    },
+                );
+                let start_x = segment_end.start_x;
+                let mut end_x = segment_end.end_x;
+                let cluster_count = segment_end.cluster_count;
                 if line_ix != line_end_ix || (cluster_count != 0 && metrics.advance == 0.0) {
                     end_x += newline_whitespace;
                 }

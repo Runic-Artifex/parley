@@ -3,7 +3,7 @@
 
 //! Read-only ownership bounds for ordinary spans, separate from shaping and metrics.
 
-use super::flow::{ContentFlow, ContentItem};
+use super::flow::{ContentItem, LineFlow};
 use super::line::Line;
 use super::whitespace::whitespace_hangs;
 use crate::{InlineBoxKind, WhiteSpaceCollapse, style::Brush};
@@ -32,7 +32,7 @@ pub(super) fn bounds<B: Brush>(line: Line<'_, B>, style_index: usize) -> Option<
     } else {
         (start, start + metrics.advance - metrics.hanging_advance)
     };
-    for item in ContentFlow::new(line.clone()) {
+    for item in LineFlow::new(line.clone()).content() {
         match item {
             ContentItem::Atom(item) => {
                 let run = item.run;

@@ -3,7 +3,7 @@
 
 //! Visual positioning of zero-advance spans, separate from shaping and caret items.
 
-use super::flow::BoxFlow;
+use super::flow::LineFlow;
 use super::line::Line;
 use crate::style::Brush;
 
@@ -55,7 +55,7 @@ pub(super) fn positions<'a, B: Brush>(
             // item order; out-of-flow boxes have no reserved advance.
             let mut preceding_box = None;
             let mut following_box = None;
-            for item in BoxFlow::new(line.clone()) {
+            for item in LineFlow::new(line.clone()).boxes() {
                 if item.inline_box.index == span.index {
                     if item.box_index + 1 == span.boxes_before {
                         preceding_box = Some(item.x + if item.is_rtl { 0. } else { item.advance });

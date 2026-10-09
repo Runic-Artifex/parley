@@ -3,8 +3,9 @@
 
 use crate::layout::Style;
 use crate::layout::data::BreakReason;
+use crate::layout::flow::LineFlow;
 use crate::layout::layout::Layout;
-use crate::layout::line::{Line, LineItem};
+use crate::layout::line::Line;
 use crate::layout::run::Run;
 use crate::style::Brush;
 
@@ -83,40 +84,8 @@ impl<'a, B: Brush> Cluster<'a, B> {
         let mut line_index = 0;
         if let Some((index, line)) = layout.line_for_offset(y) {
             line_index = index;
-            let mut offset = line.metrics().offset + line.metrics().inline_min_coord;
-            let last_run_index = line.len().saturating_sub(1);
-            for item in line.items_nonpositioned() {
-                match item {
-                    LineItem::Run(run) => {
-                        let is_last_run = run.index as usize == last_run_index;
-                        let run_advance = run.advance();
-                        if x > offset + run_advance && (exact || !is_last_run) {
-                            offset += run_advance;
-                            continue;
-                        }
-                        for cluster in run.visual_clusters() {
-                            let is_last_cluster = is_last_run && cluster.is_line_right_end_of_run();
-                            let cluster_advance = cluster.advance();
-                            let edge = offset;
-                            offset += cluster_advance;
-                            if x > offset && (exact || !is_last_cluster) {
-                                continue;
-                            }
-                            if x < edge && exact {
-                                continue;
-                            }
-                            let side = if x <= edge + cluster_advance * 0.5 {
-                                ClusterSide::Left
-                            } else {
-                                ClusterSide::Right
-                            };
-                            return Some((cluster, side));
-                        }
-                    }
-                    LineItem::InlineBox(inline_box) => {
-                        offset += inline_box.width;
-                    }
-                }
+            if let Some(hit) = LineFlow::new(line).cluster_at(x, exact) {
+                return Some(hit);
             }
         }
         if y <= 0.0 && !exact {
@@ -258,7 +227,7 @@ impl<'a, B: Brush> Cluster<'a, B> {
     }
 
     /// Whether this cluster is at the line-right end of the run.
-    fn is_line_right_end_of_run(&self) -> bool {
+    pub(super) fn is_line_right_end_of_run(&self) -> bool {
         let chars = self.run.line_slice().char_range();
         if self.is_rtl() {
             self.grapheme.char_range().start == chars.start
@@ -443,31 +412,7 @@ impl<'a, B: Brush> Cluster<'a, B> {
     /// This cost of this function is roughly linear in the number of clusters
     /// on the containing line.
     pub fn visual_offset(&self) -> Option<f32> {
-        let line = self.line();
-        let mut offset = line.metrics().offset;
-        for run_index in 0..=self.run.index as usize {
-            let item = line.item(run_index)?;
-            match item {
-                LineItem::Run(run) => {
-                    if run_index != self.run.index as usize {
-                        offset += run.advance();
-                    } else {
-                        for cluster in run.visual_clusters() {
-                            if cluster.grapheme.char_range().start
-                                == self.grapheme.char_range().start
-                            {
-                                break;
-                            }
-                            offset += cluster.advance();
-                        }
-                    }
-                }
-                LineItem::InlineBox(inline_box) => {
-                    offset += inline_box.width;
-                }
-            }
-        }
-        Some(offset)
+        LineFlow::new(self.line()).cluster_offset(self)
     }
 }
 

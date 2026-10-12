@@ -5,6 +5,8 @@
 
 use crate::CharmapIndex;
 
+use alloc::sync::Arc;
+
 use super::source::{SourceInfo, SourceKind};
 use super::{Blob, source_cache::SourceCache};
 use crate::{FontStyle, FontWeight, FontWidth};
@@ -23,6 +25,7 @@ pub struct FontInfo {
     style: FontStyle,
     weight: FontWeight,
     weight_range: Option<(FontWeight, FontWeight)>,
+    unicode_range: Option<Arc<[(u32, u32)]>>,
     axes: AxisVec,
     attr_axes: u8,
     charmap_index: CharmapIndex,
@@ -92,6 +95,23 @@ impl FontInfo {
     /// intrinsic visual weight or variation axes.
     pub fn weight_range(&self) -> Option<(FontWeight, FontWeight)> {
         self.weight_range
+    }
+
+    /// Returns the inclusive code point ranges supplied at registration, if
+    /// any: CSS `@font-face` `unicode-range`. A font with a range is used only
+    /// for the characters in it, whatever else its character map covers.
+    pub fn unicode_range(&self) -> Option<&[(u32, u32)]> {
+        self.unicode_range.as_deref()
+    }
+
+    pub(crate) fn shared_unicode_range(&self) -> Option<Arc<[(u32, u32)]>> {
+        self.unicode_range.clone()
+    }
+
+    /// Returns `true` if the font may be used for `codepoint`: it has no
+    /// [`unicode_range`](Self::unicode_range), or the range includes it.
+    pub fn covers(&self, codepoint: u32) -> bool {
+        range_covers(self.unicode_range.as_deref(), codepoint)
     }
 
     pub(crate) fn matching_weight(&self, requested: FontWeight) -> FontWeight {
@@ -272,6 +292,7 @@ impl FontInfo {
             style,
             weight,
             weight_range: None,
+            unicode_range: None,
             axes,
             attr_axes,
             charmap_index,
@@ -313,6 +334,9 @@ impl FontInfo {
                     FontWeight::new(min.value().max(max.value())),
                 ));
             }
+        }
+        if let Some(ranges) = info_override.unicode_range {
+            self.unicode_range = Some(ranges.into());
         }
         if let Some(axes) = info_override.axes {
             // This is O(n^2) but no font should have enough axes for that to
@@ -516,9 +540,28 @@ pub struct FontInfoOverride<'a> {
     /// clamped to it. Reversed endpoints are normalized and nonfinite ranges
     /// ignored. When absent, the existing single-weight behavior is retained.
     pub weight_range: Option<(FontWeight, FontWeight)>,
+    /// Inclusive code point ranges the font is used for, as CSS `@font-face`
+    /// `unicode-range`: a query offers the font for a character only if a range
+    /// includes it (see [`QueryFont::charmap`]), and faces registered with a
+    /// range are offered last-registered first, as CSS Fonts 4 orders the
+    /// `@font-face` rules of a family. When absent, every character the font
+    /// maps is covered and registration order is kept.
+    ///
+    /// [`QueryFont::charmap`]: crate::QueryFont::charmap
+    pub unicode_range: Option<&'a [(u32, u32)]>,
     /// Default values for the font's variation axes. Axes not included within
     /// the font will be ignored.
     pub axes: Option<&'a [(Tag, f32)]>,
+}
+
+/// Whether the inclusive code point `ranges` include `codepoint`; no ranges
+/// cover every code point.
+pub(crate) fn range_covers(ranges: Option<&[(u32, u32)]>, codepoint: u32) -> bool {
+    ranges.is_none_or(|ranges| {
+        ranges
+            .iter()
+            .any(|&(start, end)| (start..=end).contains(&codepoint))
+    })
 }
 
 #[cfg(test)]

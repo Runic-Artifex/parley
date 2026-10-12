@@ -7,6 +7,7 @@ use crate::{Charmap, CharmapIndex};
 
 use super::super::{Collection, SourceCache, matching::match_fonts};
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use parlance::Script;
 use smallvec::SmallVec;
@@ -172,19 +173,27 @@ impl<'a> Query<'a> {
     }
 
     /// Returns the [first available font] for the current settings: the first
-    /// font that [`matches_with`](Self::matches_with) would yield, if any.
-    ///
-    /// CSS additionally requires the font's `unicode-range` to include U+0020
-    /// SPACE; fontique has no `unicode-range`, so every available font qualifies.
+    /// font that [`matches_with`](Self::matches_with) would yield whose
+    /// `unicode-range` (see [`FontInfoOverride::unicode_range`]) includes U+0020
+    /// SPACE. As in Chromium, when no font's range includes it, the first font.
     ///
     /// [first available font]: https://drafts.csswg.org/css-fonts-4/#first-available-font
+    /// [`FontInfoOverride::unicode_range`]: crate::FontInfoOverride::unicode_range
     pub fn first_available_font(&mut self) -> Option<QueryFont> {
+        let mut first = None;
         let mut found = None;
         self.matches_with(|font| {
-            found = Some(font.clone());
-            QueryStatus::Stop
+            if first.is_none() {
+                first = Some(font);
+            }
+            if font.covers(' ' as u32) {
+                found = Some(font.clone());
+                QueryStatus::Stop
+            } else {
+                QueryStatus::Continue
+            }
         });
-        found
+        found.or_else(|| first.cloned())
     }
 }
 
@@ -250,12 +259,26 @@ pub struct QueryFont {
     pub synthesis: Synthesis,
     /// Data used for constructing a character map for this font.
     pub charmap_index: CharmapIndex,
+    /// The inclusive code point ranges the font is used for, if it was
+    /// registered with any (CSS `@font-face` `unicode-range`).
+    pub unicode_range: Option<Arc<[(u32, u32)]>>,
 }
 
 impl QueryFont {
-    /// Attempts to construct a [Charmap] for this font.
+    /// Attempts to construct a [Charmap] for this font. It maps only the
+    /// characters in the font's [`unicode_range`](Self::unicode_range), so
+    /// that a face is a candidate for a character only if its range includes
+    /// it, as in CSS.
     pub fn charmap(&self) -> Option<Charmap<'_>> {
-        self.charmap_index.charmap(self.blob.as_ref())
+        self.charmap_index
+            .charmap(self.blob.as_ref())
+            .map(|charmap| charmap.with_unicode_range(self.unicode_range.as_deref()))
+    }
+
+    /// Returns `true` if the font may be used for `codepoint`: it has no
+    /// [`unicode_range`](Self::unicode_range), or the range includes it.
+    pub fn covers(&self, codepoint: u32) -> bool {
+        crate::font::range_covers(self.unicode_range.as_deref(), codepoint)
     }
 }
 
@@ -271,13 +294,22 @@ fn load_bucket<'a>(
         Entry::Ok(fonts) => fonts,
         status @ Entry::Vacant => {
             *status = Entry::Error;
-            let indices = match_fonts(
+            let mut indices: SmallVec<[usize; 4]> = match_fonts(
                 family.fonts(),
                 attributes.width,
                 attributes.style,
                 attributes.weight,
                 true,
-            );
+            )
+            .collect();
+            // Faces registered with a `unicode-range` come first, the last
+            // registered first: CSS Fonts 4 checks the `@font-face` rules of a
+            // family in reverse order of definition, and Chromium does
+            // (CSSSegmentedFontFace::GetFontData walks its faces in reverse).
+            indices.sort_by_key(|&index| match family.fonts()[index].unicode_range() {
+                Some(_) => (0, usize::MAX - index),
+                None => (1, index),
+            });
             let mut fonts: SmallVec<[QueryFont; 1]> = SmallVec::new();
             for index in indices {
                 let Some(font_info) = family.fonts().get(index) else {
@@ -296,6 +328,7 @@ fn load_bucket<'a>(
                         attributes.weight,
                     ),
                     charmap_index: font_info.charmap_index(),
+                    unicode_range: font_info.shared_unicode_range(),
                 });
             }
             if fonts.is_empty() {
@@ -335,6 +368,7 @@ fn load_font<'a>(
                 index: blob_index,
                 synthesis,
                 charmap_index: font_info.charmap_index(),
+                unicode_range: font_info.shared_unicode_range(),
             });
             if let Entry::Ok(font) = status {
                 Some(font)
@@ -374,4 +408,136 @@ enum Entry<T> {
     Ok(T),
     Vacant,
     Error,
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec::Vec;
+
+    use super::*;
+    use crate::{Collection, CollectionOptions, FontInfoOverride};
+
+    const ROBOTO: &[u8] =
+        include_bytes!("../../../parley_dev/assets/fonts/roboto_fonts/Roboto-Regular.ttf");
+
+    const CYRILLIC: &[(u32, u32)] = &[(0x0301, 0x0301), (0x0400, 0x045F), (0x2116, 0x2116)];
+    const LATIN_EXT: &[(u32, u32)] = &[(0x0100, 0x02BA), (0x2020, 0x2020)];
+    const LATIN: &[(u32, u32)] = &[(0x0000, 0x00FF), (0x2000, 0x206F)];
+
+    /// A family of one font registered once per `ranges`, in that order, as
+    /// fontsource's `@font-face` rules declare its subsets.
+    fn family(ranges: &[Option<&[(u32, u32)]>]) -> Collection {
+        let mut collection = Collection::new(CollectionOptions {
+            shared: false,
+            system_fonts: false,
+        });
+        for range in ranges {
+            collection.register_fonts(
+                Blob::new(Arc::new(ROBOTO.to_vec())),
+                Some(FontInfoOverride {
+                    family_name: Some("Subsets"),
+                    unicode_range: *range,
+                    ..Default::default()
+                }),
+            );
+        }
+        collection
+    }
+
+    fn query_ranges(collection: &mut Collection) -> Vec<Option<Vec<(u32, u32)>>> {
+        let mut source_cache = SourceCache::default();
+        let mut query = collection.query(&mut source_cache);
+        query.set_families(["Subsets"]);
+        let mut ranges = Vec::new();
+        query.matches_with(|font| {
+            ranges.push(font.unicode_range.as_deref().map(<[_]>::to_vec));
+            QueryStatus::Continue
+        });
+        ranges
+    }
+
+    fn first_available_range(collection: &mut Collection) -> Option<Vec<(u32, u32)>> {
+        let mut source_cache = SourceCache::default();
+        let mut query = collection.query(&mut source_cache);
+        query.set_families(["Subsets"]);
+        query
+            .first_available_font()
+            .and_then(|font| font.unicode_range.as_deref().map(<[_]>::to_vec))
+    }
+
+    /// The first font that maps `ch`, as text shaping selects a font.
+    fn font_for(collection: &mut Collection, ch: char) -> Option<Vec<(u32, u32)>> {
+        let mut source_cache = SourceCache::default();
+        let mut query = collection.query(&mut source_cache);
+        query.set_families(["Subsets"]);
+        let mut found = None;
+        query.matches_with(|font| {
+            if font.charmap().and_then(|charmap| charmap.map(ch)).is_some() {
+                found = Some(font.unicode_range.as_deref().map(<[_]>::to_vec));
+                QueryStatus::Stop
+            } else {
+                QueryStatus::Continue
+            }
+        });
+        found.flatten()
+    }
+
+    /// Faces with a `unicode-range` are offered last-registered first, as
+    /// CSS Fonts 4 and Chromium order the `@font-face` rules of a family.
+    #[test]
+    fn ranged_faces_are_offered_in_reverse_registration_order() {
+        let mut collection = family(&[Some(CYRILLIC), Some(LATIN_EXT), Some(LATIN)]);
+        assert_eq!(
+            query_ranges(&mut collection),
+            [
+                Some(LATIN.to_vec()),
+                Some(LATIN_EXT.to_vec()),
+                Some(CYRILLIC.to_vec())
+            ]
+        );
+    }
+
+    /// Without ranges, registration order is kept.
+    #[test]
+    fn faces_without_ranges_keep_registration_order() {
+        let mut collection = family(&[None, Some(LATIN), None]);
+        assert_eq!(
+            query_ranges(&mut collection),
+            [Some(LATIN.to_vec()), None, None]
+        );
+    }
+
+    /// A face maps only the characters in its range, although the font maps
+    /// more: Roboto has `0`, `a` and `Ж` in every face here.
+    #[test]
+    fn a_face_is_a_candidate_only_for_characters_in_its_range() {
+        let mut collection = family(&[Some(CYRILLIC), Some(LATIN_EXT), Some(LATIN)]);
+        assert_eq!(font_for(&mut collection, '0'), Some(LATIN.to_vec()));
+        assert_eq!(font_for(&mut collection, 'a'), Some(LATIN.to_vec()));
+        assert_eq!(font_for(&mut collection, 'Ж'), Some(CYRILLIC.to_vec()));
+        assert_eq!(font_for(&mut collection, 'Ł'), Some(LATIN_EXT.to_vec()));
+        // U+2020 is in the latin and latin-ext ranges: the last defined wins.
+        assert_eq!(font_for(&mut collection, '\u{2020}'), Some(LATIN.to_vec()));
+        // No range includes U+4E00.
+        assert_eq!(font_for(&mut collection, '\u{4E00}'), None);
+    }
+
+    /// The first available font is the first face whose range includes
+    /// U+0020, whatever the registration order; else the first face.
+    #[test]
+    fn first_available_font_has_space_in_its_range() {
+        for order in [
+            [CYRILLIC, LATIN_EXT, LATIN],
+            [LATIN, CYRILLIC, LATIN_EXT],
+            [LATIN_EXT, LATIN, CYRILLIC],
+        ] {
+            let mut collection = family(&order.map(Some));
+            assert_eq!(first_available_range(&mut collection), Some(LATIN.to_vec()));
+        }
+        let mut collection = family(&[Some(LATIN_EXT), Some(CYRILLIC)]);
+        assert_eq!(
+            first_available_range(&mut collection),
+            Some(CYRILLIC.to_vec())
+        );
+    }
 }

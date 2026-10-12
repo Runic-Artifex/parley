@@ -5,6 +5,8 @@
 
 use parley_engine::{Atom, Grapheme, ShapedSlice, shape::Whitespace};
 
+use super::inline_edges::EdgeGap;
+
 /// Whether the whitespace is a word separator.
 ///
 /// This mostly follows [CSS Text 3 § 7.1][css-word-separator], in that fixed-width spaces are not
@@ -47,12 +49,22 @@ pub(crate) struct Gaps {
     ///
     /// For vertical text, this is to the bottom.
     pub(crate) after: f32,
+
+    /// The part of [`Self::before`] reserved by inline box edges (margin, border, padding).
+    ///
+    /// Unlike spacing, edge advances never hang and never belong to the atom's text.
+    pub(crate) edge_before: f32,
+
+    /// The part of [`Self::after`] reserved by inline box edges.
+    pub(crate) edge_after: f32,
 }
 
 impl Gaps {
     pub(crate) const ZERO: Self = Self {
         before: 0.,
         after: 0.,
+        edge_before: 0.,
+        edge_after: 0.,
     };
 
     /// The total gap.
@@ -108,6 +120,8 @@ impl Spacing {
         let mut gaps = Gaps {
             before: 0.,
             after: self.letter,
+            edge_before: 0.,
+            edge_after: 0.,
         };
 
         if is_word_separator(whitespace) {
@@ -147,12 +161,14 @@ impl Default for Justification {
 
 /// Additional spacing to apply, including justification (if any).
 #[derive(Copy, Clone, Debug)]
-pub(crate) struct EffectiveSpacing {
+pub(crate) struct EffectiveSpacing<'a> {
     spacing: Spacing,
     justification: Justification,
+    /// Nonzero inline box edge advances of the run's atoms, sorted by atom start cluster.
+    edges: &'a [EdgeGap],
 }
 
-impl EffectiveSpacing {
+impl<'a> EffectiveSpacing<'a> {
     /// The combined [`Spacing`] and [`Justification`] effective for a run.
     ///
     /// To measure text for purposes like line breaking, pass [`Justification::NONE`].
@@ -161,12 +177,34 @@ impl EffectiveSpacing {
         Self {
             spacing,
             justification,
+            edges: &[],
         }
+    }
+
+    /// The same spacing, plus the run's nonzero inline box edge advances.
+    #[inline(always)]
+    pub(crate) const fn with_edges(self, edges: &'a [EdgeGap]) -> Self {
+        Self { edges, ..self }
     }
 
     #[inline(always)]
     pub(crate) const fn is_zero(self) -> bool {
-        self.spacing.is_zero() && self.justification.amount_per_opportunity == 0.
+        self.spacing.is_zero()
+            && self.justification.amount_per_opportunity == 0.
+            && self.edges.is_empty()
+    }
+
+    /// The inline box edge advance attached to `atom`, if any.
+    #[inline(always)]
+    pub(crate) fn edge(self, atom: &Atom<'_>) -> Option<&'a EdgeGap> {
+        if self.edges.is_empty() {
+            return None;
+        }
+        let start = atom.shaped_clusters_range().start;
+        self.edges
+            .binary_search_by_key(&start, |edge| edge.cluster)
+            .ok()
+            .map(|index| &self.edges[index])
     }
 
     /// The gaps around `atom`.
@@ -179,6 +217,13 @@ impl EffectiveSpacing {
             && atom.shaped_clusters_range().end <= self.justification.justification_end_cluster
         {
             gaps.after += self.justification.amount_per_opportunity;
+        }
+
+        if let Some(edge) = self.edge(atom) {
+            gaps.before += edge.before;
+            gaps.after += edge.after;
+            gaps.edge_before = edge.before;
+            gaps.edge_after = edge.after;
         }
 
         gaps

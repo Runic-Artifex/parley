@@ -159,6 +159,22 @@ impl<'a, B: Brush> Cluster<'a, B> {
         spacing.grapheme_advance(&self.atom, self.grapheme, self.is_rtl())
     }
 
+    /// Returns the parts of [`Self::advance`] at the cluster's visual left and right that are
+    /// reserved by horizontal inline box edges (margin, border and padding) rather than by
+    /// the cluster's text.
+    pub fn inline_edge_insets(&self) -> (f32, f32) {
+        let gaps = self.run.line_spacing().gaps(&self.atom);
+        let (owns_before, owns_after) = if self.is_rtl() {
+            (self.grapheme.is_atom_end(), self.grapheme.is_atom_start())
+        } else {
+            (self.grapheme.is_atom_start(), self.grapheme.is_atom_end())
+        };
+        (
+            if owns_before { gaps.edge_before } else { 0. },
+            if owns_after { gaps.edge_after } else { 0. },
+        )
+    }
+
     /// Returns `true` if this is a right-to-left cluster.
     pub fn is_rtl(&self) -> bool {
         self.run.is_rtl()

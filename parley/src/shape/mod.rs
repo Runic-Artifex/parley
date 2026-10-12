@@ -154,12 +154,14 @@ pub(crate) fn shape_text<'a, B: Brush>(
 
                 // Itemization-only boundaries can coincide with each other or atomic boxes.
                 // Like boxes, discard entries already passed by an independent bidi split.
+                // A boundary inside a grapheme cluster (a combining mark or the second regional
+                // indicator of a flag) keeps the grapheme whole.
                 while let Some(boundary) = boundary_iter.peek() {
                     if boundary.byte_index < byte_index {
                         boundary_iter.next();
                     } else if boundary.byte_index == byte_index {
                         boundary_iter.next();
-                        split = true;
+                        split |= analysis.char_info()[char_index].is_grapheme_start();
                     } else {
                         break;
                     }

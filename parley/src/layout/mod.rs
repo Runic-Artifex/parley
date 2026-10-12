@@ -7,6 +7,7 @@ mod alignment;
 mod cluster;
 mod empty_spans;
 pub(crate) mod flow;
+pub(crate) mod inline_edges;
 mod line;
 mod line_alignment;
 mod line_break;
@@ -32,6 +33,7 @@ pub(crate) mod data;
 pub use alignment::{Alignment, AlignmentOptions};
 pub use cluster::{Affinity, Cluster, ClusterPath, ClusterSide};
 pub use data::BreakReason;
+pub use inline_edges::InlineEdges;
 pub use layout::Layout;
 pub use line::{GlyphRun, Line, LineMetrics, PositionedInlineBox, PositionedLayoutItem};
 pub use line_break::{

@@ -4,6 +4,7 @@
 //! Read-only ownership bounds for ordinary spans, separate from shaping and metrics.
 
 use super::flow::{ContentItem, LineFlow};
+use super::inline_edges::gap_extents;
 use super::line::Line;
 use super::whitespace::whitespace_hangs;
 use crate::{InlineBoxKind, WhiteSpaceCollapse, style::Brush};
@@ -42,6 +43,25 @@ pub(super) fn bounds<B: Brush>(line: Line<'_, B>, style_index: usize) -> Option<
                 let chars = atom.characters();
                 let first = chars.first()?.text_byte_start as usize;
                 let end = chars.last()?.text_byte_range().end;
+                let edge = run.line_spacing().edge(&atom).copied();
+                let mut owns_edge = false;
+                if let Some(edge) = &edge {
+                    owns_edge = gap_extents(
+                        &line.layout.data,
+                        edge,
+                        run.is_rtl(),
+                        x,
+                        advance,
+                        style,
+                        true,
+                        &mut include,
+                    );
+                }
+                let (x, advance) = match &edge {
+                    // The atom's own extent, without the box edges around it.
+                    Some(edge) => (x + edge.before, advance - edge.before - edge.after),
+                    None => (x, advance),
+                };
                 let (collapsed, all_collapse) = collapsed_suffix(run, &atom);
                 let (mut left, mut right) = (x, x + advance);
                 if all_collapse {
@@ -58,7 +78,10 @@ pub(super) fn bounds<B: Brush>(line: Line<'_, B>, style_index: usize) -> Option<
                 }
                 if span.range.contains(&first) {
                     include(left, right);
-                } else if !span.range.is_empty() && span.range.start < end && first < span.range.end
+                } else if !owns_edge
+                    && !span.range.is_empty()
+                    && span.range.start < end
+                    && first < span.range.end
                 {
                     // Continuation-only ownership has no caret fraction: the atom belongs
                     // in full to its first code unit's owner, and this span follows its end.
@@ -108,7 +131,10 @@ fn collapsed_suffix<B: Brush>(run: super::run::Run<'_, B>, atom: &Atom<'_>) -> (
         }
         advance += cluster.advance;
     }
-    let gaps = run.line_spacing().gaps(atom);
+    let mut gaps = run.line_spacing().gaps(atom);
+    // Inline box edges are not part of the collapsed text.
+    gaps.before -= gaps.edge_before;
+    gaps.after -= gaps.edge_after;
     if advance != 0. || all_collapse {
         advance += if run.is_rtl() {
             gaps.before

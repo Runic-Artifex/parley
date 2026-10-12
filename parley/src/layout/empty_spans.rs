@@ -13,6 +13,10 @@ pub(super) fn positions<'a, B: Brush>(
     line.layout.data.empty_spans[line.data.empty_spans.clone()]
         .iter()
         .map(move |span| {
+            // Between nonzero box edges, the anchor follows the authored edge order.
+            if let Some((x, _)) = super::inline_edges::edge_event_bounds(&line, span.style) {
+                return (usize::from(span.style), x);
+            }
             // Prefer the preceding cluster on this line. At a wrap this keeps the anchor with
             // the breaker's owning line; at a forced break the following line uses its first
             // cluster. Visual offsets are recomputed after justification/alignment.

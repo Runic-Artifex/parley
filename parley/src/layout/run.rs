@@ -123,13 +123,17 @@ impl<'a, B: Brush> Run<'a, B> {
     }
 
     #[inline]
-    pub(crate) fn line_spacing(&self) -> EffectiveSpacing {
+    pub(crate) fn line_spacing(&self) -> EffectiveSpacing<'a> {
         let justification = if self.line_data.is_some() {
             self.layout.data.lines[self.line_index as usize].justification
         } else {
             Justification::NONE
         };
-        EffectiveSpacing::new(self.data.spacing, justification)
+        EffectiveSpacing::new(self.data.spacing, justification).with_edges(
+            self.layout
+                .data
+                .run_edge_gaps(self.shaped_text_run_index as usize),
+        )
     }
 
     /// Returns the advance for the run.
@@ -265,7 +269,7 @@ pub(crate) struct Glyphs<'a> {
     slice: ShapedSlice<'a>,
     is_rtl: bool,
     /// The spacing to apply, if any. Without spacing, atoms are not tracked.
-    spacing: Option<EffectiveSpacing>,
+    spacing: Option<EffectiveSpacing<'a>>,
     /// The shaped clusters not yet visited: all of `slice`'s clusters without spacing, otherwise
     /// those of the current atom. Visited in logical order for LTR text and in reverse for RTL.
     shaped_clusters: Range<u32>,
@@ -281,7 +285,7 @@ pub(crate) struct Glyphs<'a> {
 }
 
 impl<'a> Glyphs<'a> {
-    fn new(slice: ShapedSlice<'a>, is_rtl: bool, spacing: EffectiveSpacing) -> Self {
+    fn new(slice: ShapedSlice<'a>, is_rtl: bool, spacing: EffectiveSpacing<'a>) -> Self {
         let clusters = slice.shaped_clusters_range();
         Self {
             slice,

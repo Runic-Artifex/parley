@@ -393,6 +393,21 @@ impl<'a, B: Brush> GlyphRun<'a, B> {
         self.offset
     }
 
+    /// Returns the advances at the visual left and right ends of this glyph run that are
+    /// reserved by horizontal inline box edges (margin, border and padding of spans that open
+    /// or close there) rather than by the glyphs.
+    ///
+    /// Both are zero unless [`Layout::update_inline_edges`](crate::Layout::update_inline_edges)
+    /// set nonzero edges.
+    pub fn inline_edge_insets(&self) -> (f32, f32) {
+        super::inline_edges::cluster_range_insets(
+            &self.run.layout.data,
+            self.run.shaped_text_run_index as usize,
+            self.shaped_clusters.clone(),
+            self.run.is_rtl(),
+        )
+    }
+
     /// Returns the total advance of the run.
     pub fn advance(&self) -> f32 {
         self.advance
@@ -434,7 +449,7 @@ impl<'a, B: Brush> GlyphRun<'a, B> {
 #[derive(Clone)]
 pub(super) struct AtomIter<'a> {
     atoms: Atoms<'a>,
-    spacing: EffectiveSpacing,
+    spacing: EffectiveSpacing<'a>,
     is_rtl: bool,
     /// The next atom in visual order, if it has been peeked but not yet consumed.
     peeked: Option<Atom<'a>>,

@@ -84,14 +84,16 @@ pub(crate) fn atom_hanging_advance<B: Brush>(
     slice: ShapedSlice<'_>,
     atom: &Atom<'_>,
     styles: &[Style<B>],
-    spacing: EffectiveSpacing,
+    spacing: EffectiveSpacing<'_>,
     is_rtl: bool,
 ) -> (f32, bool) {
     let gaps = spacing.gaps(atom);
+    // Inline box edges never hang.
+    let (before, after) = (gaps.before - gaps.edge_before, gaps.after - gaps.edge_after);
     let (gap_start, gap_end) = if is_rtl {
-        (gaps.after, gaps.before)
+        (after, before)
     } else {
-        (gaps.before, gaps.after)
+        (before, after)
     };
     let mut last_cluster = true;
     let mut all_hang = true;

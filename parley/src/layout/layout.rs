@@ -3,6 +3,7 @@
 
 use crate::layout::alignment::align;
 use crate::layout::data::LayoutData;
+use crate::layout::inline_edges::InlineEdges;
 use crate::style::Brush;
 use crate::{InlineBox, VerticalAlign};
 use core::cmp::Ordering;
@@ -112,6 +113,86 @@ impl<B: Brush> Layout<B> {
             );
         }
         true
+    }
+
+    /// Updates the horizontal inline box edges of styles without reshaping.
+    ///
+    /// `edges` has one entry per style in [`Self::styles`]; `None` leaves a style's edges
+    /// unchanged. Edges apply to spans tracked by the builder (see
+    /// `TreeBuilder::set_style_span_tracking`): opening edges belong to the span's first
+    /// fragment and closing edges to its last fragment. Edges are attached to the shaped atoms
+    /// next to the span's boundaries when the layout is built, so an edge inside a whole atom
+    /// (for example a ligature) follows that atom's end.
+    ///
+    /// Returns `false` (and changes nothing) if `edges` has the wrong length or a value is
+    /// negative or not finite. Call [`Self::break_all_lines`] or [`Self::break_lines`] again
+    /// before using positions or content widths.
+    pub fn update_inline_edges(&mut self, edges: &[Option<InlineEdges>]) -> bool {
+        if edges.len() != self.data.styles.len() {
+            return false;
+        }
+        let valid = |e: &InlineEdges| {
+            [
+                e.start_margin,
+                e.start_border,
+                e.start_padding,
+                e.end_padding,
+                e.end_border,
+                e.end_margin,
+            ]
+            .iter()
+            .all(|v| v.is_finite() && *v >= 0.)
+        };
+        if edges.iter().flatten().any(|e| !valid(e)) {
+            return false;
+        }
+        if self.data.inline_edges.len() != self.data.styles.len() {
+            self.data
+                .inline_edges
+                .resize(self.data.styles.len(), InlineEdges::ZERO);
+        }
+        let mut changed = false;
+        for (current, edge) in self.data.inline_edges.iter_mut().zip(edges) {
+            if let Some(edge) = edge {
+                if current != edge {
+                    *current = *edge;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.data.refresh_edge_gaps();
+        }
+        true
+    }
+
+    /// Whether a style with nonzero horizontal inline box edges has an edge that no shaped atom
+    /// carries (for example a span in a layout without text, or one enclosed by inline boxes).
+    /// Such edges take no space.
+    pub fn has_unplaced_inline_edges(&self) -> bool {
+        self.data
+            .unplaced_edge_events
+            .iter()
+            .any(|event| self.data.edge_event_width(*event) != 0.)
+    }
+
+    /// Whether a nonzero inline box edge advance is attached to right-to-left text.
+    pub fn has_rtl_inline_edges(&self) -> bool {
+        self.data.edge_gaps.iter().any(|gap| {
+            let site = &self.data.edge_sites[gap.site as usize];
+            self.data.shaped_text.runs()[site.run as usize]
+                .bidi_level
+                .is_rtl()
+        })
+    }
+
+    /// The current horizontal inline box edges of `style`.
+    pub fn inline_edges(&self, style: usize) -> InlineEdges {
+        self.data
+            .inline_edges
+            .get(style)
+            .copied()
+            .unwrap_or_default()
     }
 
     /// Returns the length of the source text, in bytes.

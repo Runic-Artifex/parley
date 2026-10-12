@@ -44,6 +44,8 @@ pub(crate) struct RunData {
     /// This can happen when ligatures span across styles, or (awkwardly) if a style changes within
     /// a grapheme.
     pub(crate) has_mixed_style_atoms: bool,
+    /// This run's nonzero inline box edge advances, into [`LayoutData::edge_gaps`].
+    pub(crate) edge_gaps: Range<u32>,
 }
 
 /// The metrics of a run's box. This differs from the style-derived box by taking into account any
@@ -212,6 +214,16 @@ pub(crate) struct LayoutData<B: Brush> {
     pub(crate) span_edges: Vec<crate::resolve::tree::SpanEdge>,
     /// Authored edge/box order with immutable normalized box sites. No flow advances.
     pub(crate) span_controls: Vec<crate::resolve::tree::SpanControl>,
+    /// Horizontal inline box edges per style.
+    pub(crate) inline_edges: Vec<super::inline_edges::InlineEdges>,
+    /// The atoms carrying span edge events.
+    pub(crate) edge_sites: Vec<super::inline_edges::EdgeSite>,
+    /// Span edge events attached to atoms, indexed by [`Self::edge_sites`].
+    pub(crate) edge_events: Vec<super::inline_edges::EdgeEvent>,
+    /// Span edge events without an atom to attach to.
+    pub(crate) unplaced_edge_events: Vec<super::inline_edges::EdgeEvent>,
+    /// Nonzero edge advances of atoms, grouped by run.
+    pub(crate) edge_gaps: Vec<super::inline_edges::EdgeGap>,
     // General settings (directly from the "builder")
     /// The display scale factor
     pub(crate) scale: f32,
@@ -272,6 +284,11 @@ impl<B: Brush> Default for LayoutData<B> {
             style_spans: Vec::new(),
             span_edges: Vec::new(),
             span_controls: Vec::new(),
+            inline_edges: Vec::new(),
+            edge_sites: Vec::new(),
+            edge_events: Vec::new(),
+            unplaced_edge_events: Vec::new(),
+            edge_gaps: Vec::new(),
             scale: 1.,
             quantize: true,
             quantization_mode: QuantizationMode::Device,
@@ -309,6 +326,11 @@ impl<B: Brush> LayoutData<B> {
         self.style_spans.clear();
         self.span_edges.clear();
         self.span_controls.clear();
+        self.inline_edges.clear();
+        self.edge_sites.clear();
+        self.edge_events.clear();
+        self.unplaced_edge_events.clear();
+        self.edge_gaps.clear();
         self.scale = 1.;
         self.quantize = true;
         self.quantization_mode = QuantizationMode::Device;
@@ -415,6 +437,7 @@ impl<B: Brush> LayoutData<B> {
             spacing,
             run_box,
             has_mixed_style_atoms,
+            edge_gaps: 0..0,
         };
 
         self.runs.push(run);
@@ -521,12 +544,14 @@ impl ContentWidthsMeasurer {
                     // paragraph level are guaranteed to be at that edge.
                     let can_hang = item.bidi_level == layout_data.base_level;
                     let is_rtl = item.bidi_level.is_rtl();
+                    let edges = layout_data.run_edge_gaps(item.index);
 
                     if run_spacing.is_zero() {
                         self.measure_text_run::<B, false>(
                             &layout_data.styles,
                             slice,
                             run_spacing,
+                            edges,
                             can_hang,
                             is_rtl,
                         );
@@ -535,6 +560,7 @@ impl ContentWidthsMeasurer {
                             &layout_data.styles,
                             slice,
                             run_spacing,
+                            edges,
                             can_hang,
                             is_rtl,
                         );
@@ -578,10 +604,15 @@ impl ContentWidthsMeasurer {
         styles: &[Style<B>],
         slice: ShapedSlice<'_>,
         spacing: Spacing,
+        edges: &[super::inline_edges::EdgeGap],
         can_hang: bool,
         is_rtl: bool,
     ) {
         let clusters = slice.shaped_clusters();
+        let first_cluster = slice.shaped_clusters_range().start;
+        // Inline box edges of the current atom: they never hang, and are added at the atom's
+        // logical start and end.
+        let mut edge: Option<super::inline_edges::EdgeGap> = None;
 
         // The spacing gap of the current atom.
         let mut gap = 0.;
@@ -609,6 +640,16 @@ impl ContentWidthsMeasurer {
                 }
                 if SPACED {
                     gap = spacing.gaps(whitespace).after;
+                }
+                if !edges.is_empty() {
+                    let cluster_index = first_cluster + i as u32;
+                    if let Ok(index) =
+                        edges.binary_search_by_key(&cluster_index, |edge| edge.cluster)
+                    {
+                        self.running_min_width += edges[index].lead;
+                        self.running_max_width += edges[index].lead;
+                        edge = Some(edges[index]);
+                    }
                 }
             } else if skip_atom {
                 continue;
@@ -650,6 +691,14 @@ impl ContentWidthsMeasurer {
                     style.white_space_collapse == WhiteSpaceCollapse::Preserve;
             } else {
                 self.running_hanging_whitespace = 0.0;
+            }
+
+            if let Some(atom_edge) = edge {
+                if first_cluster + i as u32 + 1 == atom_edge.end_cluster {
+                    self.running_min_width += atom_edge.trail;
+                    self.running_max_width += atom_edge.trail;
+                    edge = None;
+                }
             }
         }
     }

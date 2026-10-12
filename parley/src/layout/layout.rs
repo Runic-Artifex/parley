@@ -186,6 +186,42 @@ impl<B: Brush> Layout<B> {
         })
     }
 
+    /// The sides (logical start, end) of `style`'s span at which an out-of-flow inline box was
+    /// pushed while collapsible whitespace was pending: the box shares the edge's normalized
+    /// position, but is placed before that whitespace (its [`InlineBox::index`] precedes the
+    /// position). Edges at such a side are not placed consistently with the box.
+    ///
+    /// This depends only on the built text, not on the current edge values.
+    pub fn inline_edge_sides_with_pending_out_of_flow_box(&self, style: usize) -> (bool, bool) {
+        use crate::InlineBoxKind;
+        use crate::resolve::tree::{SpanControl, SpanEdgeKind};
+        let mut sides = (false, false);
+        let Ok(style) = u16::try_from(style) else {
+            return sides;
+        };
+        for control in &self.data.span_controls {
+            let SpanControl::InlineBox { index, anchor } = *control else {
+                continue;
+            };
+            let Some(placed) = self.data.inline_boxes.get(index) else {
+                continue;
+            };
+            if placed.inline_box.kind == InlineBoxKind::InFlow || placed.inline_box.index == anchor
+            {
+                continue;
+            }
+            for edge in &self.data.span_edges {
+                if edge.style == style && edge.index == anchor {
+                    match edge.kind {
+                        SpanEdgeKind::Open => sides.0 = true,
+                        SpanEdgeKind::Close => sides.1 = true,
+                    }
+                }
+            }
+        }
+        sides
+    }
+
     /// The current horizontal inline box edges of `style`.
     pub fn inline_edges(&self, style: usize) -> InlineEdges {
         self.data

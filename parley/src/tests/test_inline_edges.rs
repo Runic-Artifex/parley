@@ -311,3 +311,115 @@ fn closing_edge_right_after_a_forced_break_ends_the_first_line() {
     close(lines[1].metrics().advance, second);
     assert!(lines[1].style_span_bounds(span).is_none());
 }
+
+#[test]
+fn forced_break_after_the_closing_edge_does_not_extend_the_border_box() {
+    // `a<span>b\n</span>c` under pre, and `a<span>b<br></span>c` (a preserved newline in a
+    // non-ordinary child span).
+    let preserve = || TextStyle {
+        white_space_collapse: WhiteSpaceCollapse::Preserve,
+        ..style()
+    };
+    let shapes: [&dyn Fn(&mut TreeBuilder<'_, ColorBrush>); 2] = [
+        &|builder| {
+            builder.push_style_span_with_shaping_boundaries(preserve(), true, true);
+            builder.push_text("b\n");
+            builder.pop_style_span();
+        },
+        &|builder| {
+            builder.push_style_span_with_shaping_boundaries(style(), true, true);
+            builder.push_text("b");
+            builder.push_style_modification_span(&[crate::StyleProperty::WhiteSpaceCollapse(
+                WhiteSpaceCollapse::Preserve,
+            )]);
+            builder.push_text("\n");
+            builder.pop_style_span();
+            builder.pop_style_span();
+        },
+    ];
+    for shape in shapes {
+        let (mut fcx, mut lcx) = (create_font_context(), LayoutContext::new());
+        let mut layout = build(&mut fcx, &mut lcx, |builder| {
+            builder.push_text("a");
+            shape(builder);
+            builder.push_text("c");
+        });
+        let span = span_style(&layout, 0);
+        let before = layout
+            .lines()
+            .next()
+            .unwrap()
+            .style_span_bounds(span)
+            .unwrap();
+        set(&mut layout, span, EDGES);
+        layout.break_all_lines(None);
+        assert_eq!(layout.len(), 2);
+        let after = layout
+            .lines()
+            .next()
+            .unwrap()
+            .style_span_bounds(span)
+            .unwrap();
+        // The border box ends at the closing border (6 + 4 + 5 past the content), not at the
+        // newline after the closing margin (6 + 15).
+        close(after.0, before.0 + 1.);
+        close(after.1, before.1 + 15.);
+    }
+}
+
+#[test]
+fn out_of_flow_box_pushed_at_pending_whitespace_marks_its_edge_side() {
+    use crate::{InlineBox, InlineBoxKind, VerticalAlign};
+    let oof = || InlineBox {
+        id: 9,
+        kind: InlineBoxKind::OutOfFlow,
+        index: 0,
+        width: 9.,
+        height: 12.,
+        baseline: None,
+        vertical_align: VerticalAlign::BASELINE,
+    };
+    let (mut fcx, mut lcx) = (create_font_context(), LayoutContext::new());
+    // `e <span><oof/>\u{301}</span>Z`: the box is placed before the pending space, the
+    // opening edge after it.
+    let layout = build(&mut fcx, &mut lcx, |builder| {
+        builder.push_text("e ");
+        builder.push_style_span_with_shaping_boundaries(style(), false, false);
+        builder.push_inline_box(oof());
+        builder.push_text("\u{301}");
+        builder.pop_style_span();
+        builder.push_text("Z");
+    });
+    let span = span_style(&layout, 0);
+    assert_eq!(
+        layout.inline_edge_sides_with_pending_out_of_flow_box(span),
+        (true, false)
+    );
+    // `e<span><oof/> \u{301}</span>Z`: nothing is pending when the box is pushed.
+    let layout = build(&mut fcx, &mut lcx, |builder| {
+        builder.push_text("e");
+        builder.push_style_span_with_shaping_boundaries(style(), false, false);
+        builder.push_inline_box(oof());
+        builder.push_text(" \u{301}");
+        builder.pop_style_span();
+        builder.push_text("Z");
+    });
+    let span = span_style(&layout, 0);
+    assert_eq!(
+        layout.inline_edge_sides_with_pending_out_of_flow_box(span),
+        (false, false)
+    );
+    // `<span>a </span><oof/>b`: a box after the close shares the closing edge's position.
+    let layout = build(&mut fcx, &mut lcx, |builder| {
+        builder.push_style_span_with_shaping_boundaries(style(), false, false);
+        builder.push_text("a ");
+        builder.pop_style_span();
+        builder.push_inline_box(oof());
+        builder.push_text("b");
+    });
+    let span = span_style(&layout, 0);
+    assert_eq!(
+        layout.inline_edge_sides_with_pending_out_of_flow_box(span),
+        (false, true)
+    );
+}

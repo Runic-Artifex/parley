@@ -9,6 +9,7 @@ use super::line::Line;
 use super::whitespace::whitespace_hangs;
 use crate::{InlineBoxKind, WhiteSpaceCollapse, style::Brush};
 use parley_engine::Atom;
+use parley_engine::shape::Whitespace;
 
 pub(super) fn bounds<B: Brush>(line: Line<'_, B>, style_index: usize) -> Option<(f32, f32)> {
     let style = u16::try_from(style_index).ok()?;
@@ -33,6 +34,15 @@ pub(super) fn bounds<B: Brush>(line: Line<'_, B>, style_index: usize) -> Option<
     } else {
         (start, start + metrics.advance - metrics.hanging_advance)
     };
+    // A forced break right after the span's own nonzero closing edge sits past that edge
+    // (and past the span's own margin); its zero-width newline does not extend the border box.
+    let closes_here = line
+        .layout
+        .data
+        .inline_edges
+        .get(style_index)
+        .is_some_and(|edges| edges.end() != 0.)
+        && line.inline_edge_sides(style_index).1;
     for item in LineFlow::new(line.clone()).content() {
         match item {
             ContentItem::Atom(item) => {
@@ -62,6 +72,12 @@ pub(super) fn bounds<B: Brush>(line: Line<'_, B>, style_index: usize) -> Option<
                     Some(edge) => (x + edge.before, advance - edge.before - edge.after),
                     None => (x, advance),
                 };
+                if closes_here
+                    && advance == 0.
+                    && chars.iter().all(|c| c.whitespace == Whitespace::Newline)
+                {
+                    continue;
+                }
                 let (collapsed, all_collapse) = collapsed_suffix(run, &atom);
                 let (mut left, mut right) = (x, x + advance);
                 if all_collapse {

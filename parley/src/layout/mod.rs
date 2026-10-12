@@ -4,6 +4,7 @@
 //! Layout types.
 
 mod alignment;
+pub(crate) mod balance;
 mod cluster;
 mod empty_spans;
 pub(crate) mod flow;
@@ -31,6 +32,7 @@ pub use parley_engine::{FontMetrics, Glyph};
 pub(crate) mod data;
 
 pub use alignment::{Alignment, AlignmentOptions};
+pub use balance::{BalanceOptions, MAX_LINES_FOR_BALANCE};
 pub use cluster::{Affinity, Cluster, ClusterPath, ClusterSide};
 pub use data::BreakReason;
 pub use inline_edges::InlineEdges;

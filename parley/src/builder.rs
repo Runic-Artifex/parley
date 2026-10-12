@@ -574,6 +574,7 @@ fn build_into_layout<B: Brush>(
         &layout.data.shaped_text,
         layout.data.quantization(),
         &mut layout.data.style_metrics,
+        &mut layout.data.root_space_advance,
     );
 
     // Move inline boxes into the layout

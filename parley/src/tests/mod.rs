@@ -3,6 +3,7 @@
 
 mod test_alignment_refresh;
 mod test_analysis;
+mod test_balance;
 mod test_builders;
 mod test_content_flow;
 mod test_inline_edges;

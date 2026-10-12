@@ -163,6 +163,38 @@ impl FontMetrics {
         (height.is_finite() && height > 0.).then_some(height)
     }
 
+    /// The horizontal advance of the space (U+0020) glyph at `font_size`, in the same units as
+    /// `font_size`.
+    ///
+    /// Synthesis axis settings are applied before authored `variations`, as in
+    /// [`Self::from_font_instance`]. Invalid fonts and fonts without a space glyph return `None`.
+    pub fn space_advance(
+        font: &FontInstance,
+        font_size: f32,
+        variations: &[parlance::FontVariation],
+    ) -> Option<f32> {
+        let font_ref =
+            skrifa::FontRef::from_index(font.font.data.as_ref(), font.font.index).ok()?;
+        let location = font_ref.axes().location(
+            font.synthesis
+                .variation_settings()
+                .iter()
+                .map(|(tag, value)| (skrifa::Tag::new(&tag.to_be_bytes()), *value))
+                .chain(
+                    variations
+                        .iter()
+                        .map(|v| (skrifa::Tag::new(&v.tag.to_bytes()), v.value)),
+                ),
+        );
+        let glyph_id = font_ref.charmap().map(' ')?;
+        if glyph_id.to_u32() == 0 {
+            return None;
+        }
+        font_ref
+            .glyph_metrics(skrifa::prelude::Size::new(font_size), &location)
+            .advance_width(glyph_id)
+    }
+
     fn from_skrifa_metrics(metrics: &skrifa::metrics::Metrics) -> Self {
         let units_per_em = metrics.units_per_em as f32;
 

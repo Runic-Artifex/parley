@@ -11,6 +11,7 @@ use core_maths::CoreFloat;
 use parlance::BidiLevel;
 
 use crate::layout::Quantization;
+use crate::layout::balance::{BalanceState, BreakKey};
 use crate::layout::data::{AlignedSubtreeOffset, StyleBaselineOffset, run_box_metrics};
 use crate::layout::line_alignment::{Extents, LineAlignment, SubtreeExtents};
 use crate::layout::line_commit::{append_line_items, legacy_commit_items, reorder_line_items};
@@ -95,6 +96,11 @@ struct LineState {
     /// These are the line's justification opportunities, before subtracting those that end up in
     /// the line's hanging whitespace.
     num_word_separators: u32,
+
+    /// Whether content that does not fit was appended to the line because no break opportunity
+    /// was available, i.e., the line overflows. Balanced line breaking does not apply to such
+    /// paragraphs (see [`crate::layout::balance`]).
+    overflowed: bool,
 }
 
 impl LineState {
@@ -104,6 +110,7 @@ impl LineState {
         self.x = 0.0;
         self.box_metrics.reset();
         self.num_word_separators = 0;
+        self.overflowed = false;
     }
 }
 
@@ -727,6 +734,8 @@ pub struct BreakLines<'a, B: Brush> {
     state: BreakerState,
     prev_state: Option<BreakerState>,
     done: bool,
+    /// Balanced line breaking (`text-wrap-style: balance`), see [`crate::layout::balance`].
+    balance: Option<BalanceState>,
 }
 
 impl<'a, B: Brush> BreakLines<'a, B> {
@@ -745,9 +754,28 @@ impl<'a, B: Brush> BreakLines<'a, B> {
             state: BreakerState::default(),
             prev_state: None,
             done: false,
+            balance: None,
         };
         this.reset_line();
         this
+    }
+
+    /// Break the lines of this paragraph as directed by balanced line breaking.
+    pub(crate) fn set_balance(&mut self, balance: BalanceState) {
+        self.balance = Some(balance);
+    }
+
+    /// Take back the balanced line breaking state, e.g. the collected break candidates.
+    pub(crate) fn take_balance(&mut self) -> Option<BalanceState> {
+        self.balance.take()
+    }
+
+    /// Whether balanced line breaking directs the current line to end at `key`.
+    #[inline(always)]
+    fn balance_breaks_at(&self, key: BreakKey) -> bool {
+        self.balance
+            .as_ref()
+            .is_some_and(|balance| balance.breaks_at(self.lines.lines.len(), key))
     }
 
     /// Reset the per-line running state in preparation for building a new line.
@@ -994,6 +1022,13 @@ impl<'a, B: Brush> BreakLines<'a, B> {
 
         let max_advance = max_advance - line_indent;
 
+        // The advance content is fit against. Balanced line breaking may override it; the line
+        // keeps `max_advance` for whitespace hanging and alignment.
+        let fit_advance = match &self.balance {
+            Some(balance) => balance.fit_advance(self.lines.lines.len(), max_advance, line_indent),
+            None => max_advance,
+        };
+
         // Iterate over remaining runs in the Layout
         let item_count = self.layout.data.items.len();
         while self.state.item_idx < item_count {
@@ -1030,7 +1065,7 @@ impl<'a, B: Brush> BreakLines<'a, B> {
                     // Compute the x position of the content being currently processed
                     let next_x = self.state.line.x + width_contribution;
 
-                    let box_will_be_appended = next_x <= max_advance || self.state.line.x == 0.0;
+                    let box_will_be_appended = next_x <= fit_advance || self.state.line.x == 0.0;
                     if (height_contribution > self.state.line_max_height
                         || self.state.line.max_height_exceeded)
                         && box_will_be_appended
@@ -1040,19 +1075,39 @@ impl<'a, B: Brush> BreakLines<'a, B> {
 
                     // If the box fits on the current line (or we are at the start of the current line)
                     // then simply move on to the next item
-                    if next_x <= max_advance || self.state.line.text_wrap_mode != TextWrapMode::Wrap
+                    if next_x <= fit_advance || self.state.line.text_wrap_mode != TextWrapMode::Wrap
                     {
                         self.append_layout_inline_box(item.index, next_x);
+                        if let Some(balance) = &mut self.balance {
+                            balance.content_end = next_x;
+                        }
 
                         // There is a soft wrap opportunity after an inline box, unless wrapping
                         // is disabled
                         if self.state.line.text_wrap_mode == TextWrapMode::Wrap {
+                            let key = BreakKey::after_box(self.state.item_idx);
+                            if self.balance_breaks_at(key) {
+                                return self.start_new_line(
+                                    BreakReason::Regular,
+                                    max_advance,
+                                    line_indent,
+                                );
+                            }
                             self.state.mark_line_break_opportunity();
+                            if let Some(balance) = &mut self.balance {
+                                let line = &self.state.line;
+                                balance.collect(
+                                    key,
+                                    line.x,
+                                    (line.items.end, line.clusters.end, line.boxes_processed),
+                                );
+                            }
                         }
                     } else {
                         // If we're at the start of the line, this box will never fit, so consume it and accept the overflow.
                         let reason = if self.state.line.x == 0.0 {
                             self.append_layout_inline_box(item.index, next_x);
+                            self.state.line.overflowed = true;
                             BreakReason::Emergency
                         } else {
                             BreakReason::Regular
@@ -1116,8 +1171,26 @@ impl<'a, B: Brush> BreakLines<'a, B> {
                             // We don't record boundaries when the advance is 0. As we do not want overflowing content to cause extra consecutive
                             // line breaks. We should accept the overflowing fragment in that scenario.
                             if self.state.line.x != 0.0 {
+                                let key = BreakKey::before_atom(
+                                    self.state.item_idx,
+                                    atom.shaped_clusters_range().start,
+                                );
+                                if self.balance_breaks_at(key) {
+                                    return self.start_new_line(
+                                        BreakReason::Regular,
+                                        max_advance,
+                                        line_indent,
+                                    );
+                                }
                                 self.state.mark_line_break_opportunity();
-                                // break_opportunity = true;
+                                if let Some(balance) = &mut self.balance {
+                                    let line = &self.state.line;
+                                    balance.collect(
+                                        key,
+                                        line.x,
+                                        (line.items.end, line.clusters.end, line.boxes_processed),
+                                    );
+                                }
                             }
                         } else if
                         // This text can contribute "emergency" line breaks.
@@ -1139,7 +1212,7 @@ impl<'a, B: Brush> BreakLines<'a, B> {
                         // If the content fits (the x position does NOT exceed max_advance)
                         //
                         // We simply append the atom to the current line
-                        if next_x <= max_advance {
+                        if next_x <= fit_advance {
                             if max_height_exceeded {
                                 return self.max_height_break_data(line_height);
                             }
@@ -1150,6 +1223,22 @@ impl<'a, B: Brush> BreakLines<'a, B> {
                                 &self.layout.data,
                                 is_separator,
                             );
+                            // Track where the content ends if the line were broken here, i.e.
+                            // excluding hanging whitespace.
+                            if let Some(balance) = &mut self.balance
+                                && balance.is_collecting()
+                            {
+                                let (hanging, all_hang) = atom_hanging_advance(
+                                    slice,
+                                    &atom,
+                                    &self.layout.data.styles,
+                                    spacing,
+                                    item.bidi_level.is_rtl(),
+                                );
+                                if !all_hang {
+                                    balance.content_end = next_x - hanging;
+                                }
+                            }
                         }
                         // Else we attempt to line break:
                         //
@@ -1167,7 +1256,7 @@ impl<'a, B: Brush> BreakLines<'a, B> {
                                 spacing,
                                 item.bidi_level.is_rtl(),
                             );
-                            if all_hang || next_x - hanging <= max_advance {
+                            if all_hang || next_x - hanging <= fit_advance {
                                 if max_height_exceeded {
                                     return self.max_height_break_data(line_height);
                                 }
@@ -1222,6 +1311,9 @@ impl<'a, B: Brush> BreakLines<'a, B> {
                                     &self.layout.data,
                                     is_separator,
                                 );
+                                if style.text_wrap_mode == TextWrapMode::Wrap {
+                                    self.state.line.overflowed = true;
+                                }
                             }
                         }
                     }
@@ -1707,6 +1799,7 @@ fn commit_line<B: Brush>(
             ..Justification::NONE
         },
         indent: line_indent,
+        overflowed: state.overflowed,
         metrics: LineMetrics {
             advance: state.x,
             hanging_advance,

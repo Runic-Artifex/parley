@@ -88,9 +88,11 @@ pub(crate) fn resolve_style_metrics<B: Brush>(
     shaped_text: &ShapedText,
     quantization: Quantization,
     out: &mut Vec<StyleMetrics>,
+    root_space_advance: &mut Option<f32>,
 ) {
     out.clear();
     out.reserve(styles.len());
+    *root_space_advance = None;
 
     let mut query = fcx.collection.query(&mut fcx.source_cache);
     // Reuse fallback measurements for spans sharing a primary font, size and variation
@@ -101,6 +103,10 @@ pub(crate) fn resolve_style_metrics<B: Brush>(
         let font_metrics = first_available_font(&mut query, rcx, style)
             .and_then(|font| {
                 let variations = rcx.variations(style.font_variations).unwrap_or(&[]);
+                if index == 0 {
+                    *root_space_advance =
+                        FontMetrics::space_advance(&font, style.font_size, variations);
+                }
                 let mut metrics =
                     shaped_run_metrics(shaped_text, &font, style.font_size, variations).or_else(
                         || FontMetrics::from_font_instance(&font, style.font_size, variations),

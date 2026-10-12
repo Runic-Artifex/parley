@@ -99,6 +99,8 @@ pub(crate) struct LineData {
     pub(crate) justification: Justification,
     /// Text indent applied to this line.
     pub(crate) indent: f32,
+    /// Whether the line overflows because content was appended without a break opportunity.
+    pub(crate) overflowed: bool,
     /// This line's entries in [`LayoutData::aligned_subtree_offsets`].
     ///
     /// Empty for lines with only baseline-relative content because the top-level aligned
@@ -241,6 +243,9 @@ pub(crate) struct LayoutData<B: Brush> {
     // Output of style resolution (input to line breaking)
     pub(crate) styles: Vec<Style<B>>,
     pub(crate) style_metrics: Vec<StyleMetrics>,
+    /// The advance of the space glyph of the root style's first available font at the root font
+    /// size. `text-wrap-style: balance` estimates line counts with it (see `balance.rs`).
+    pub(crate) root_space_advance: Option<f32>,
     pub(crate) inline_boxes: Vec<LayoutInlineBox>,
 
     // Output of shaping (input to line breaking)
@@ -300,6 +305,7 @@ impl<B: Brush> Default for LayoutData<B> {
             height: 0.,
             styles: Vec::new(),
             style_metrics: Vec::new(),
+            root_space_advance: None,
             inline_boxes: Vec::new(),
             shaped_text: ShapedText::new(),
             runs: Vec::new(),
@@ -345,6 +351,7 @@ impl<B: Brush> LayoutData<B> {
         self.indent_options = IndentOptions::default();
         self.styles.clear();
         self.style_metrics.clear();
+        self.root_space_advance = None;
         self.inline_boxes.clear();
         self.shaped_text.clear();
         self.runs.clear();

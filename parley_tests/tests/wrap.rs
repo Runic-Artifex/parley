@@ -6,8 +6,8 @@
 use crate::test_name;
 use crate::util::{ColorBrush, TestEnv};
 use parley::{
-    Alignment, AlignmentOptions, BreakReason, CHROMIUM_LINE_BREAK_OVERRIDE, OverflowWrap,
-    StyleProperty, TextWrapMode, WordBreak,
+    Alignment, AlignmentOptions, BreakReason, CHROMIUM_LINE_BREAK_OVERRIDE, ContentWidths,
+    InlineBox, InlineBoxKind, OverflowWrap, StyleProperty, TextWrapMode, VerticalAlign, WordBreak,
 };
 use peniko::color::palette::css;
 
@@ -398,6 +398,43 @@ fn text_wrap_mode_allows_break_before_nowrap_span() {
         "world!",
         "Second line should contain the NoWrap span"
     );
+}
+
+/// Two atomic inlines with no text between them (Bootstrap's and data tables'
+/// `white-space: nowrap` strips of inline blocks): under `nowrap` there is no
+/// soft wrap opportunity between them, in line breaking and in the min-content
+/// width, as in Chromium 153 (`display: inline-block` 500px and 60px spans in a
+/// 300px `nowrap` scroller lay out on one line, scrollWidth 560).
+#[test]
+fn text_wrap_mode_nowrap_keeps_adjacent_inline_boxes_together() {
+    let mut env = TestEnv::new(test_name!(), None);
+    // The first box fits the line, or overflows it alone.
+    for (first, mode, lines, min) in [
+        (100.0, TextWrapMode::NoWrap, 1, 160.0),
+        (100.0, TextWrapMode::Wrap, 2, 100.0),
+        (150.0, TextWrapMode::NoWrap, 1, 210.0),
+        (150.0, TextWrapMode::Wrap, 2, 150.0),
+    ] {
+        let text = "";
+        let mut builder = env.ranged_builder(text);
+        builder.push_default(StyleProperty::TextWrapMode(mode));
+        for (id, width) in [(0, first), (1, 60.0)] {
+            builder.push_inline_box(InlineBox {
+                id,
+                kind: InlineBoxKind::InFlow,
+                index: 0,
+                width,
+                height: 10.0,
+                baseline: None,
+                vertical_align: VerticalAlign::BASELINE,
+            });
+        }
+        let mut layout = builder.build(text);
+        let ContentWidths { min: min_width, .. } = layout.calculate_content_widths();
+        assert_eq!(min_width, min, "{mode:?}: min-content width");
+        layout.break_all_lines(Some(120.0));
+        assert_eq!(layout.len(), lines, "{mode:?}: lines");
+    }
 }
 
 #[test]

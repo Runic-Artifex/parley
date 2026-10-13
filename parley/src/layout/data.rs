@@ -574,7 +574,12 @@ impl ContentWidthsMeasurer {
                     }
                 }
                 LayoutItemKind::InlineBox => {
-                    self.measure_inline_box(&layout_data.inline_boxes[item.index].inline_box);
+                    let layout_box = &layout_data.inline_boxes[item.index];
+                    self.measure_inline_box(
+                        &layout_box.inline_box,
+                        layout_data.styles[usize::from(layout_box.parent_style_index)]
+                            .text_wrap_mode,
+                    );
                 }
             }
         }
@@ -710,18 +715,21 @@ impl ContentWidthsMeasurer {
         }
     }
 
-    fn measure_inline_box(&mut self, inline_box: &InlineBox) {
+    /// Measures an inline box of the span whose wrap mode is `parent_wrap_mode`.
+    fn measure_inline_box(&mut self, inline_box: &InlineBox, parent_wrap_mode: TextWrapMode) {
         if inline_box.kind == InlineBoxKind::InFlow {
-            // Inline boxes have soft wrap opportunities on both sides.
-            let wraps = self.text_wrap_mode == TextWrapMode::Wrap;
-            if wraps {
+            // Inline boxes have soft wrap opportunities on both sides: before it as the
+            // previous atom's wrap mode allows, after it as its span's does (the box is an
+            // atom of that span, as in line breaking).
+            if self.text_wrap_mode == TextWrapMode::Wrap {
                 self.soft_break();
             }
+            self.text_wrap_mode = parent_wrap_mode;
             // Inline boxes don't hang.
             self.running_hanging_whitespace = 0.0;
             self.running_min_width += inline_box.width;
             self.running_max_width += inline_box.width;
-            if wraps {
+            if self.text_wrap_mode == TextWrapMode::Wrap {
                 self.soft_break();
             }
         }

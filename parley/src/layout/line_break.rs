@@ -1077,10 +1077,19 @@ impl<'a, B: Brush> BreakLines<'a, B> {
                     // then simply move on to the next item
                     if next_x <= fit_advance || self.state.line.text_wrap_mode != TextWrapMode::Wrap
                     {
-                        self.append_layout_inline_box(item.index, next_x);
+                        let box_index = item.index;
+                        self.append_layout_inline_box(box_index, next_x);
                         if let Some(balance) = &mut self.balance {
                             balance.content_end = next_x;
                         }
+                        // The box is an atom of the span containing it: as for text, the
+                        // opportunity after it (and so before the next atom) follows that
+                        // span's wrap mode (two atomic inlines in a `nowrap` span stay on
+                        // one line even without text between them).
+                        let parent_style =
+                            self.layout.data.inline_boxes[box_index].parent_style_index;
+                        self.state.line.text_wrap_mode =
+                            self.layout.data.styles[usize::from(parent_style)].text_wrap_mode;
 
                         // There is a soft wrap opportunity after an inline box, unless wrapping
                         // is disabled
@@ -1106,8 +1115,18 @@ impl<'a, B: Brush> BreakLines<'a, B> {
                     } else {
                         // If we're at the start of the line, this box will never fit, so consume it and accept the overflow.
                         let reason = if self.state.line.x == 0.0 {
-                            self.append_layout_inline_box(item.index, next_x);
+                            let box_index = item.index;
+                            self.append_layout_inline_box(box_index, next_x);
                             self.state.line.overflowed = true;
+                            // As above, the opportunity after the box follows its span's
+                            // wrap mode: in a `nowrap` span the line goes on.
+                            let parent_style =
+                                self.layout.data.inline_boxes[box_index].parent_style_index;
+                            self.state.line.text_wrap_mode =
+                                self.layout.data.styles[usize::from(parent_style)].text_wrap_mode;
+                            if self.state.line.text_wrap_mode != TextWrapMode::Wrap {
+                                continue;
+                            }
                             BreakReason::Emergency
                         } else {
                             BreakReason::Regular

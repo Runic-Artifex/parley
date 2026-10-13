@@ -3,12 +3,13 @@
 
 //! Query support.
 
-use crate::{Charmap, CharmapIndex};
+use crate::{Charmap, CharmapIndex, FontInfo};
 
 use super::super::{Collection, SourceCache, matching::match_fonts};
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::cmp::Reverse;
 use parlance::Script;
 use smallvec::SmallVec;
 
@@ -302,13 +303,39 @@ fn load_bucket<'a>(
                 true,
             )
             .collect();
-            // Faces registered with a `unicode-range` come first, the last
-            // registered first: CSS Fonts 4 checks the `@font-face` rules of a
-            // family in reverse order of definition, and Chromium does
-            // (CSSSegmentedFontFace::GetFontData walks its faces in reverse).
-            indices.sort_by_key(|&index| match family.fonts()[index].unicode_range() {
-                Some(_) => (0, usize::MAX - index),
-                None => (1, index),
+            // Faces registered with a `unicode-range` come first. Faces with
+            // the same width, style and weight form one segmented face, whose
+            // faces are offered last defined (by `FontInfoOverride::order`,
+            // then by registration) first: CSS Fonts 4 checks the
+            // `@font-face` rules of a family in reverse order of definition,
+            // and Chromium does (CSSSegmentedFontFace::GetFontData walks its
+            // faces in reverse). Segmented faces that match equally well keep
+            // the order of their first faces (Chromium takes one of them, by
+            // the order of its own map).
+            let fonts_of_family = family.fonts();
+            let position = |index: usize| (fonts_of_family[index].order(), index);
+            let same_capabilities = |a: &FontInfo, b: &FontInfo| {
+                a.width() == b.width()
+                    && a.style() == b.style()
+                    && a.weight() == b.weight()
+                    && a.weight_range() == b.weight_range()
+            };
+            let candidates = indices.clone();
+            indices.sort_by_key(|&index| {
+                let font = &fonts_of_family[index];
+                if font.unicode_range().is_none() {
+                    return (1, (None, index), Reverse((None, 0)));
+                }
+                let segmented = candidates
+                    .iter()
+                    .filter(|&&other| {
+                        let other_font = &fonts_of_family[other];
+                        other_font.unicode_range().is_some() && same_capabilities(other_font, font)
+                    })
+                    .map(|&other| position(other))
+                    .min()
+                    .unwrap_or(position(index));
+                (0, segmented, Reverse(position(index)))
             });
             let mut fonts: SmallVec<[QueryFont; 1]> = SmallVec::new();
             for index in indices {
@@ -493,6 +520,71 @@ mod tests {
                 Some(LATIN.to_vec()),
                 Some(LATIN_EXT.to_vec()),
                 Some(CYRILLIC.to_vec())
+            ]
+        );
+    }
+
+    /// With an `order`, faces with a range are offered by it, last first,
+    /// whatever order they were registered in (as `@font-face` sources finish
+    /// loading); equal orders keep reverse registration order.
+    #[test]
+    fn ranged_faces_are_offered_in_reverse_order() {
+        let mut collection = Collection::new(CollectionOptions {
+            shared: false,
+            system_fonts: false,
+        });
+        // Defined cyrillic, latin-ext, latin; loaded latin, cyrillic, latin-ext.
+        for (range, order) in [(LATIN, 2), (CYRILLIC, 0), (LATIN_EXT, 1)] {
+            collection.register_fonts(
+                Blob::new(Arc::new(ROBOTO.to_vec())),
+                Some(FontInfoOverride {
+                    family_name: Some("Subsets"),
+                    unicode_range: Some(range),
+                    order: Some(order),
+                    ..Default::default()
+                }),
+            );
+        }
+        assert_eq!(
+            query_ranges(&mut collection),
+            [
+                Some(LATIN.to_vec()),
+                Some(LATIN_EXT.to_vec()),
+                Some(CYRILLIC.to_vec())
+            ]
+        );
+        assert_eq!(font_for(&mut collection, '\u{2020}'), Some(LATIN.to_vec()));
+    }
+
+    /// Faces reverse only among faces of the same width, style and weight (a
+    /// segmented face); segmented faces matching a request equally keep the
+    /// order of their first faces.
+    #[test]
+    fn faces_reverse_within_their_segmented_face() {
+        let mut collection = Collection::new(CollectionOptions {
+            shared: false,
+            system_fonts: false,
+        });
+        let wide = (crate::FontWeight::new(100.0), crate::FontWeight::new(900.0));
+        let narrow = (crate::FontWeight::new(400.0), crate::FontWeight::new(600.0));
+        for (range, weights) in [(LATIN, wide), (LATIN_EXT, narrow), (CYRILLIC, wide)] {
+            collection.register_fonts(
+                Blob::new(Arc::new(ROBOTO.to_vec())),
+                Some(FontInfoOverride {
+                    family_name: Some("Subsets"),
+                    unicode_range: Some(range),
+                    weight_range: Some(weights),
+                    ..Default::default()
+                }),
+            );
+        }
+        // At weight 400 both weight ranges match exactly.
+        assert_eq!(
+            query_ranges(&mut collection),
+            [
+                Some(CYRILLIC.to_vec()),
+                Some(LATIN.to_vec()),
+                Some(LATIN_EXT.to_vec())
             ]
         );
     }

@@ -26,6 +26,7 @@ pub struct FontInfo {
     weight: FontWeight,
     weight_range: Option<(FontWeight, FontWeight)>,
     unicode_range: Option<Arc<[(u32, u32)]>>,
+    order: Option<u64>,
     axes: AxisVec,
     attr_axes: u8,
     charmap_index: CharmapIndex,
@@ -106,6 +107,12 @@ impl FontInfo {
 
     pub(crate) fn shared_unicode_range(&self) -> Option<Arc<[(u32, u32)]>> {
         self.unicode_range.clone()
+    }
+
+    /// Returns the font's position among the faces of its family supplied at
+    /// registration ([`FontInfoOverride::order`]), if any.
+    pub fn order(&self) -> Option<u64> {
+        self.order
     }
 
     /// Returns `true` if the font may be used for `codepoint`: it has no
@@ -293,6 +300,7 @@ impl FontInfo {
             weight,
             weight_range: None,
             unicode_range: None,
+            order: None,
             axes,
             attr_axes,
             charmap_index,
@@ -337,6 +345,9 @@ impl FontInfo {
         }
         if let Some(ranges) = info_override.unicode_range {
             self.unicode_range = Some(ranges.into());
+        }
+        if let Some(order) = info_override.order {
+            self.order = Some(order);
         }
         if let Some(axes) = info_override.axes {
             // This is O(n^2) but no font should have enough axes for that to
@@ -543,12 +554,21 @@ pub struct FontInfoOverride<'a> {
     /// Inclusive code point ranges the font is used for, as CSS `@font-face`
     /// `unicode-range`: a query offers the font for a character only if a range
     /// includes it (see [`QueryFont::charmap`]), and faces registered with a
-    /// range are offered last-registered first, as CSS Fonts 4 orders the
-    /// `@font-face` rules of a family. When absent, every character the font
-    /// maps is covered and registration order is kept.
+    /// range and the same width, style and weight are offered last first (by
+    /// [`order`](Self::order), then by registration), as CSS Fonts 4 orders
+    /// the `@font-face` rules of a family. When absent, every character the
+    /// font maps is covered and registration order is kept.
     ///
     /// [`QueryFont::charmap`]: crate::QueryFont::charmap
     pub unicode_range: Option<&'a [(u32, u32)]>,
+    /// The font's position among the faces of its family, such as the order
+    /// of the `@font-face` rules defining them, for a registration order that
+    /// differs from it (faces registered as their sources finish loading).
+    /// Among faces with a [`unicode_range`](Self::unicode_range) and the same
+    /// width, style and weight, a later position is offered first; a face
+    /// without one counts as earlier than any with one, and equal positions
+    /// fall back to registration order.
+    pub order: Option<u64>,
     /// Default values for the font's variation axes. Axes not included within
     /// the font will be ignored.
     pub axes: Option<&'a [(Tag, f32)]>,

@@ -9,6 +9,7 @@ mod test_content_flow;
 mod test_inline_edges;
 mod test_line_commit;
 mod test_line_flow;
+mod test_pretty;
 mod test_shaping_boundaries;
 mod test_span_edges;
 mod test_style_metrics;

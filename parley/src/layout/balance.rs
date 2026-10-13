@@ -22,6 +22,13 @@
 //!
 //! Otherwise lines stay greedy.
 //!
+//! `text-wrap-style: pretty` uses the same score line breaker (`ScoreLineBreaker::
+//! OptimalBreakPoints`) on every paragraph, but only on its last [`MAX_LINES_FOR_OPTIMAL`]
+//! lines and only if its greedy last line is a single word (no break opportunity inside)
+//! shorter than a third of the available width (`ShouldOptimize`). The last line scores no
+//! slack, only four times the penalty of the opportunity it starts at, so the orphans penalty
+//! keeps a single word off it. There is no bisection.
+//!
 //! Sources (Chromium 153.0.8010.12, `third_party/blink/renderer/core/layout/`):
 //! `inline/inline_layout_algorithm.cc` (`LineBreakStrategy`), `inline/score_line_breaker.cc`,
 //! `inline/line_break_candidate.cc`, `inline/line_breaker.cc` (`AppendCandidates`,
@@ -49,7 +56,11 @@ use crate::{InlineBoxKind, WhiteSpaceCollapse};
 /// The maximum number of lines that are balanced (Blink's `kMaxLinesForBalance`).
 pub const MAX_LINES_FOR_BALANCE: usize = 6;
 
-/// Options for [`Layout::break_all_lines_balanced`].
+/// The maximum number of lines at the end of a paragraph whose breaks `text-wrap-style: pretty`
+/// chooses (Blink's `kMaxLinesForOptimal`).
+pub const MAX_LINES_FOR_OPTIMAL: usize = 4;
+
+/// Options for [`Layout::break_all_lines_balanced`] and [`Layout::break_all_lines_pretty`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct BalanceOptions {
     /// The effective zoom: layout units per CSS pixel (the device pixel ratio when the layout is
@@ -104,8 +115,8 @@ pub(crate) enum Directive {
     Collect,
     /// Fit every line against this advance (including the text indent) instead of the line's.
     Width(f32),
-    /// End line `n` at `breaks[n]`; later lines are broken greedily.
-    Breaks(Vec<BreakKey>),
+    /// End line `n` at `breaks[n]` if it is given; other lines are broken greedily.
+    Breaks(Vec<Option<BreakKey>>),
 }
 
 /// A recorded break opportunity.
@@ -146,7 +157,7 @@ impl BalanceState {
         match &self.directive {
             // Blink sets a "nearly max" available width for lines it ends at break points.
             Directive::Collect => f32::MAX,
-            Directive::Breaks(breaks) if line < breaks.len() => f32::MAX,
+            Directive::Breaks(breaks) if matches!(breaks.get(line), Some(Some(_))) => f32::MAX,
             Directive::Breaks(_) => max_advance,
             Directive::Width(width) => width - line_indent,
         }
@@ -156,7 +167,7 @@ impl BalanceState {
     #[inline(always)]
     pub(crate) fn breaks_at(&self, line: usize, key: BreakKey) -> bool {
         match &self.directive {
-            Directive::Breaks(breaks) => breaks.get(line) == Some(&key),
+            Directive::Breaks(breaks) => breaks.get(line) == Some(&Some(key)),
             _ => false,
         }
     }
@@ -261,7 +272,26 @@ struct GreedyLine {
     /// The line width as Blink measures it: indent plus content, excluding hanging whitespace.
     width: f32,
     indent: f32,
+    text_start: usize,
     text_end: usize,
+}
+
+impl GreedyLine {
+    fn of<B: Brush>(layout: &Layout<B>) -> Vec<Self> {
+        layout
+            .data
+            .lines
+            .iter()
+            .map(|line| Self {
+                reason: line.break_reason,
+                overflowed: line.overflowed || line.break_reason == BreakReason::Emergency,
+                width: line.indent + line.metrics.advance - line.metrics.hanging_advance,
+                indent: line.indent,
+                text_start: line.text_range.start,
+                text_end: line.text_range.end,
+            })
+            .collect()
+    }
 }
 
 /// Plan balanced breaks for `layout`, whose lines have been broken greedily at `max_advance`.
@@ -289,17 +319,7 @@ pub(crate) fn plan<B: Brush>(
     }
     let zoom = if options.zoom > 0. { options.zoom } else { 1. };
     let available = LayoutUnit::from_f32_round(max_advance);
-    let greedy: Vec<GreedyLine> = data
-        .lines
-        .iter()
-        .map(|line| GreedyLine {
-            reason: line.break_reason,
-            overflowed: line.overflowed || line.break_reason == BreakReason::Emergency,
-            width: line.indent + line.metrics.advance - line.metrics.hanging_advance,
-            indent: line.indent,
-            text_end: line.text_range.end,
-        })
-        .collect();
+    let greedy = GreedyLine::of(layout);
 
     // Blink appends a forced break (`DidAppendForcedBreak`) for preserved newlines and `<br>`,
     // and a control item for each preserved tab, which disables the score line breaker.
@@ -373,7 +393,7 @@ fn score_breaks<B: Brush>(
     zoom: f32,
     options: BalanceOptions,
     rebroken: &mut bool,
-) -> Option<Vec<BreakKey>> {
+) -> Option<Vec<Option<BreakKey>>> {
     // `OptimalBreakPoints`: the greedy lines of the first paragraph.
     let mut num_lines = 0;
     for line in greedy {
@@ -405,7 +425,48 @@ fn score_breaks<B: Brush>(
 
     // `ComputeCandidates`: a sentinel at the start, every break opportunity, and the end.
     *rebroken = true;
+    let candidates = collect_candidates(layout, f32::MAX, 0)?.0;
+    let breaks = optimal_breaks(
+        candidates,
+        available,
+        first_line_indent,
+        font_size,
+        zoom,
+        options.justify,
+        true,
+    )?;
+
+    // A different number of lines than the greedy breaks falls back.
+    (breaks.len() == num_lines).then(|| breaks.into_iter().map(Some).collect())
+}
+
+/// A break candidate (Blink's `LineBreakCandidate`), positions relative to the start of the
+/// first line the candidates were collected from.
+struct Scored {
+    key: BreakKey,
+    pos_no_break: f32,
+    pos_if_break: f32,
+    penalty: f32,
+}
+
+/// `LineBreakCandidateContext`: a sentinel at the start of line `first_line`, every break
+/// opportunity from there to the end of its paragraph, and a sentinel at the end of the
+/// paragraph, with the advance of the paragraph from the line on.
+///
+/// Lines before `first_line` are broken greedily at `max_advance`.
+fn collect_candidates<B: Brush>(
+    layout: &mut Layout<B>,
+    max_advance: f32,
+    first_line: usize,
+) -> Option<(Vec<Scored>, f32)> {
     let mut breaker = layout.break_lines();
+    breaker.state_mut().set_layout_max_advance(max_advance);
+    breaker.state_mut().set_line_max_advance(max_advance);
+    for _ in 0..first_line {
+        let Some(YieldData::LineBreak(_)) = breaker.break_next() else {
+            return None;
+        };
+    }
     breaker.set_balance(BalanceState::new(Directive::Collect));
     breaker.state_mut().set_layout_max_advance(f32::MAX);
     breaker.state_mut().set_line_max_advance(f32::MAX);
@@ -415,12 +476,6 @@ fn score_breaks<B: Brush>(
     let collected = breaker.take_balance()?;
     drop(breaker);
 
-    struct Scored {
-        key: BreakKey,
-        pos_no_break: f32,
-        pos_if_break: f32,
-        penalty: f32,
-    }
     let mut candidates = Vec::with_capacity(collected.candidates.len() + 2);
     candidates.push(Scored {
         key: BreakKey::END,
@@ -440,7 +495,21 @@ fn score_breaks<B: Brush>(
         pos_if_break: collected.content_end,
         penalty: 0.,
     });
+    Some((candidates, end.advance))
+}
 
+/// `ScoreLineBreaker::Optimize` from `SetupParameters` on: the break of each line, the last one
+/// at the end of the paragraph. `balanced` selects `BalanceBreakPoints` over
+/// `OptimalBreakPoints`, whose last line scores no slack.
+fn optimal_breaks(
+    mut candidates: Vec<Scored>,
+    available: LayoutUnit,
+    first_line_indent: LayoutUnit,
+    font_size: f32,
+    zoom: f32,
+    justify: bool,
+    balanced: bool,
+) -> Option<Vec<BreakKey>> {
     // `Optimize`: not needed with fewer than three break opportunities.
     if candidates.len() < 3 + 2 {
         return None;
@@ -453,7 +522,7 @@ fn score_breaks<B: Brush>(
 
     // `SetupParameters`, with Minikin's heuristics.
     let width_times_font_size = available.clamp_negative_to_zero().to_f32() * font_size / zoom;
-    let line_penalty = if options.justify {
+    let line_penalty = if justify {
         0.
     } else {
         width_times_font_size * 2. * 2.
@@ -469,6 +538,7 @@ fn score_breaks<B: Brush>(
     // `ComputeScores`.
     const SCORE_INFINITY: f32 = f32::MAX;
     const SCORE_OVERFULL: f32 = 1e12;
+    const LAST_LINE_PENALTY_MULTIPLIER: f32 = 4.;
     struct Score {
         score: f32,
         prev_index: usize,
@@ -483,6 +553,7 @@ fn score_breaks<B: Brush>(
     let mut active = 0;
     for end in 1..candidates.len() {
         let end_candidate = &candidates[end];
+        let is_end_last_candidate = end == candidates.len() - 1;
         let mut best = SCORE_INFINITY;
         let mut best_prev_index = 0;
 
@@ -511,10 +582,16 @@ fn score_breaks<B: Brush>(
             }
             let delta = candidates[start].pos_no_break - start_edge;
 
-            // Blink's last-line exception (a penalty for a hyphen on the last line) does not
-            // apply to balancing, so every overfull line scores alike.
+            // An overfull line scores alike everywhere (Blink tests justified lines other than
+            // the last separately, with the same result). The last line of `pretty` has no
+            // width score, only a penalty for its start (Blink's penalty for a hyphen on the
+            // last line, which includes the orphans penalty).
+            let mut additional_penalty = 0.;
             let width_score = if delta < 0. {
                 SCORE_OVERFULL
+            } else if is_end_last_candidate && !balanced {
+                additional_penalty = LAST_LINE_PENALTY_MULTIPLIER * candidates[start].penalty;
+                0.
             } else {
                 delta * delta / zoom
             };
@@ -523,7 +600,7 @@ fn score_breaks<B: Brush>(
             } else {
                 best_hope = width_score;
             }
-            let score = start_score_value + width_score;
+            let score = start_score_value + width_score + additional_penalty;
             if score <= best {
                 best = score;
                 best_prev_index = start;
@@ -545,9 +622,158 @@ fn score_breaks<B: Brush>(
         index = scores[index].prev_index;
     }
     breaks.reverse();
+    Some(breaks)
+}
 
-    // A different number of lines than the greedy breaks falls back.
-    (breaks.len() == num_lines).then_some(breaks)
+/// `OptimalBreakPoints` for `text-wrap-style: pretty`: the breaks of the last lines (at most
+/// [`MAX_LINES_FOR_OPTIMAL`]) of each paragraph whose greedy last line is short.
+///
+/// Blink's score line breaker keeps the greedy lines of a paragraph in a window of
+/// `kMaxLinesForOptimal` lines that slides to the paragraph's end, and optimizes the window
+/// once it reaches the end; a line that disables score line breaking (it overflows, or has
+/// `break-spaces`) suspends it for the rest of its paragraph.
+fn plan_pretty<B: Brush>(
+    layout: &mut Layout<B>,
+    max_advance: f32,
+    options: BalanceOptions,
+    rebroken: &mut bool,
+) -> Option<Directive> {
+    let data = &layout.data;
+    if !max_advance.is_finite()
+        || max_advance >= f32::MAX
+        || (data.text_len == 0 && data.inline_boxes.is_empty())
+        || data.lines.is_empty()
+    {
+        return None;
+    }
+    // Floats are placed by the embedder and need line heights, which Blink's `LineWidths`
+    // computes only in simple cases; they are not modelled.
+    if data
+        .inline_boxes
+        .iter()
+        .any(|b| b.inline_box.kind == InlineBoxKind::CustomOutOfFlow)
+    {
+        return None;
+    }
+    // A preserved tab is a control item, which disables the score line breaker for the whole
+    // block (`InlineNode::IsScoreLineBreakDisabled`); `pretty` then breaks greedily.
+    if data.shaped_text.characters().iter().any(|character| {
+        character.whitespace == Whitespace::Tab
+            && matches!(
+                data.styles[usize::from(character.style_index)].white_space_collapse,
+                WhiteSpaceCollapse::Preserve | WhiteSpaceCollapse::BreakSpaces
+            )
+    }) {
+        return None;
+    }
+    let zoom = if options.zoom > 0. { options.zoom } else { 1. };
+    let available = LayoutUnit::from_f32_round(max_advance);
+    let font_size = data.style_metrics.first().map(|m| m.font_size)?;
+    let greedy = GreedyLine::of(layout);
+
+    let mut breaks: Vec<Option<BreakKey>> = alloc::vec![None; greedy.len()];
+    let mut optimized = false;
+    let mut start = 0;
+    while start < greedy.len() {
+        // The paragraph: its lines up to a forced break or the end.
+        let mut end = start;
+        loop {
+            end += 1;
+            if end == greedy.len()
+                || matches!(
+                    greedy[end - 1].reason,
+                    BreakReason::Explicit | BreakReason::None
+                )
+            {
+                break;
+            }
+        }
+        let paragraph = start..end;
+        start = end;
+
+        // Optimization is not needed for single line paragraphs.
+        if paragraph.len() <= 1 {
+            continue;
+        }
+        // `ShouldDisableScoreLineBreak` on any line: overflow, and `white-space: break-spaces`.
+        if greedy[paragraph.clone()].iter().any(|line| line.overflowed) {
+            continue;
+        }
+        let text = greedy[paragraph.start].text_start..greedy[paragraph.end - 1].text_end;
+        let data = &layout.data;
+        if data.shaped_text.characters().iter().any(|character| {
+            text.contains(&(character.text_byte_start as usize))
+                && data.styles[usize::from(character.style_index)].white_space_collapse
+                    == WhiteSpaceCollapse::BreakSpaces
+        }) {
+            continue;
+        }
+
+        // `ShouldOptimize`: the last line is shorter than a third of the available width and
+        // has no break opportunity inside. (Blink also optimizes after two hyphenated lines;
+        // Parley does not hyphenate.)
+        let last = paragraph.end - 1;
+        let width = LayoutUnit::from_f32_ceil(greedy[last].width).clamp_negative_to_zero();
+        if width >= LayoutUnit(available.0 / 3) {
+            continue;
+        }
+        *rebroken = true;
+        let Some((last_candidates, last_advance)) = collect_candidates(layout, max_advance, last)
+        else {
+            continue;
+        };
+        if has_inner_opportunity(&last_candidates, last_advance) {
+            continue;
+        }
+
+        // The window: the last lines of the paragraph.
+        let first = paragraph
+            .start
+            .max(paragraph.end.saturating_sub(MAX_LINES_FOR_OPTIMAL));
+        let Some((mut candidates, advance)) = collect_candidates(layout, max_advance, first) else {
+            continue;
+        };
+        if ends_with_end_opportunity(&candidates, advance) {
+            candidates.remove(candidates.len() - 2);
+        }
+        let Some(window) = optimal_breaks(
+            candidates,
+            available,
+            LayoutUnit::from_f32(greedy[first].indent),
+            font_size,
+            zoom,
+            options.justify,
+            false,
+        ) else {
+            continue;
+        };
+        // A different number of lines than the greedy breaks falls back.
+        if window.len() != paragraph.end - first {
+            continue;
+        }
+        for (line, key) in (first..paragraph.end).zip(window) {
+            breaks[line] = Some(key);
+        }
+        optimized = true;
+    }
+    optimized.then_some(Directive::Breaks(breaks))
+}
+
+/// Blink's last candidate is the end of the paragraph, after its last item (which can always
+/// break after); an opportunity Parley records after an inline box that ends the paragraph is
+/// the same position as the end sentinel.
+fn ends_with_end_opportunity(candidates: &[Scored], advance: f32) -> bool {
+    let len = candidates.len();
+    len >= 3 && {
+        let (opportunity, end) = (&candidates[len - 2], &candidates[len - 1]);
+        opportunity.pos_no_break == advance && opportunity.pos_if_break == end.pos_if_break
+    }
+}
+
+/// `LineBreaker::CanBreakInside`: whether the line (whose candidates these are) has a break
+/// opportunity other than at its end.
+fn has_inner_opportunity(candidates: &[Scored], advance: f32) -> bool {
+    candidates.len() - 2 > usize::from(ends_with_end_opportunity(candidates, advance))
 }
 
 /// The outcome of `LineBreakResults::BreakLines`.
@@ -638,6 +864,7 @@ fn bisect<B: Brush>(
                 overflowed: line.overflowed || line.break_reason == BreakReason::Emergency,
                 width: 0.,
                 indent: line.indent,
+                text_start: line.text_range.start,
                 text_end: line.text_range.end,
             })
             .collect();
@@ -671,6 +898,40 @@ impl<B: Brush> Layout<B> {
         };
         let mut rebroken = false;
         let Some(directive) = plan(self, max_advance, options, &mut rebroken) else {
+            // Planning breaks lines differently to measure them; restore the greedy lines.
+            if rebroken {
+                self.break_all_lines(Some(max_advance));
+            }
+            return false;
+        };
+        let mut breaker = self.break_lines();
+        breaker.set_balance(BalanceState::new(directive));
+        breaker.break_remaining(max_advance);
+        true
+    }
+
+    /// Breaks all lines with the specified maximum advance, as Chromium (Blink `LayoutNG`) lays
+    /// out `text-wrap-style: pretty`.
+    ///
+    /// The lines are broken greedily; then, in each paragraph (up to a forced break) whose last
+    /// line is a single word shorter than a third of the available width, Blink's score line
+    /// breaker chooses the breaks of the last [`MAX_LINES_FOR_OPTIMAL`] lines, provided it keeps
+    /// their number. It does not apply to a paragraph with an overflowing line or
+    /// `break-spaces`, nor to layouts with preserved tabs.
+    ///
+    /// Returns whether the breaks of any paragraph were chosen so; otherwise the lines are
+    /// broken greedily, as by [`Layout::break_all_lines`].
+    pub fn break_all_lines_pretty(
+        &mut self,
+        max_advance: Option<f32>,
+        options: BalanceOptions,
+    ) -> bool {
+        self.break_all_lines(max_advance);
+        let Some(max_advance) = max_advance else {
+            return false;
+        };
+        let mut rebroken = false;
+        let Some(directive) = plan_pretty(self, max_advance, options, &mut rebroken) else {
             // Planning breaks lines differently to measure them; restore the greedy lines.
             if rebroken {
                 self.break_all_lines(Some(max_advance));
